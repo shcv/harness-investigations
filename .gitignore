@@ -13,6 +13,9 @@
 # Ignore auto-filtered changes files
 **/changes/
 
+# Vendored reference material (extension dumps, etc.)
+refs/
+
 # Temp directory for sync tool
 .sync-temp/
 

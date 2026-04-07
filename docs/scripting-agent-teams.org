@@ -1,0 +1,168 @@
+#+TITLE: Scripting Claude Code Agent Teams
+
+Guide for programmatically creating teams and spawning teammates from scripts.
+
+* Prerequisites
+
+Set ~CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1~ in the environment, or pass
+~--agent-teams~ to the leader process.
+
+* Create the Team
+
+The leader process creates the team. This can be interactive or headless:
+
+#+begin_src sh
+claude --agent-teams -p "Create a team called my-team and define tasks for ..."
+#+end_src
+
+This creates the following directory structure:
+
+#+begin_example
+~/.claude/
+├── teams/my-team/
+│   ├── config.json          # team roster
+│   └── inboxes/
+│       └── team-lead.json   # leader's mailbox
+└── tasks/my-team/
+    ├── .counter             # next task ID (plain integer)
+    └── .lock                # exclusive lock file
+#+end_example
+
+* Spawn Teammates via CLI Flags
+
+Start a new ~claude~ process with these hidden flags (not in ~--help~):
+
+*Required* (all three must be provided together):
+
+| Flag             | Format              | Notes                    |
+|------------------+---------------------+--------------------------|
+| ~--agent-id~     | ~"{name}@{team}"~   | must follow this format  |
+| ~--agent-name~   | ~"{name}"~          | display name             |
+| ~--team-name~    | ~"{team}"~          | must match existing team |
+
+*Optional:*
+
+| Flag                    | Values                          | Default           |
+|-------------------------+---------------------------------+-------------------|
+| ~--agent-color~         | ~"#hex"~                        | none              |
+| ~--agent-type~          | ~"general-purpose"~ or custom   | general-purpose   |
+| ~--model~               | ~sonnet~, ~opus~, ~haiku~       | inherited         |
+| ~--plan-mode-required~  | boolean flag                    | false             |
+| ~--teammate-mode~       | ~tmux~, ~in-process~, ~auto~    | auto              |
+| ~--parent-session-id~   | UUID                            | none              |
+
+* Register in Team Config
+
+*Important:* externally-spawned agents are NOT auto-registered in
+=config.json=. Other teammates won't discover them unless you add an entry to
+the ~members~ array. Minimum required fields: ~agentId~, ~name~, ~agentType~,
+~joinedAt~.
+
+File: =~/.claude/teams/{team}/config.json=
+
+#+begin_src json
+{
+  "name": "my-team",
+  "description": "Working on feature X",
+  "createdAt": 1709251200000,
+  "leadAgentId": "team-lead@my-team",
+  "leadSessionId": "a1b2c3d4-...",
+  "members": [
+    {
+      "agentId": "team-lead@my-team",
+      "name": "team-lead",
+      "agentType": "researcher",
+      "model": "claude-sonnet-4-6",
+      "color": "#ff0000",
+      "planModeRequired": false,
+      "joinedAt": 1709251200000,
+      "backendType": "tmux",
+      "cwd": "/home/user/project"
+    },
+    {
+      "agentId": "worker-1@my-team",
+      "name": "worker-1",
+      "agentType": "general-purpose",
+      "model": "claude-sonnet-4-6",
+      "prompt": "Implement the auth module...",
+      "color": "#00ff00",
+      "planModeRequired": false,
+      "joinedAt": 1709251260000,
+      "backendType": "in-process",
+      "cwd": "/home/user/project"
+    }
+  ]
+}
+#+end_src
+
+* Seed Tasks (Optional)
+
+Each task is a separate JSON file in =~/.claude/tasks/{team}/=.
+
+File: =~/.claude/tasks/my-team/1.json=
+
+#+begin_src json
+{
+  "id": "1",
+  "subject": "Implement auth module",
+  "description": "Add JWT-based authentication to the API",
+  "status": "pending",
+  "owner": "",
+  "activeForm": "Implementing auth module",
+  "blocks": [],
+  "blockedBy": [],
+  "metadata": {}
+}
+#+end_src
+
+File: =~/.claude/tasks/my-team/2.json=
+
+#+begin_src json
+{
+  "id": "2",
+  "subject": "Write auth tests",
+  "description": "Unit tests for the JWT auth module",
+  "status": "pending",
+  "owner": "worker-1",
+  "activeForm": "Writing auth tests",
+  "blocks": [],
+  "blockedBy": ["1"],
+  "metadata": {}
+}
+#+end_src
+
+After adding tasks, update the counter file.
+
+File: =~/.claude/tasks/my-team/.counter= — plain text, just the next ID:
+
+#+begin_example
+3
+#+end_example
+
+* Send Initial Message
+
+Write to the agent's inbox to give it its first instruction.
+
+File: =~/.claude/teams/my-team/inboxes/worker-1.json=
+
+#+begin_src json
+[
+  {
+    "from": "team-lead",
+    "text": "Work on task #1: implement the auth module",
+    "timestamp": "2025-03-01T00:01:00.000Z",
+    "read": false
+  }
+]
+#+end_src
+
+Multiple messages are appended to the same array. The mailbox uses file-level
+locking (~proper-lockfile~), so concurrent writes are safe.
+
+* Key Details
+
+- Team names are sanitized to ~[a-z0-9-]~
+- Agent ID format is always ~{name}@{team}~
+- No validation is performed against the config on disk when joining — the process trusts its flags
+- Flags have been stable since v2.1.33; ~--teammate-mode~ added around v2.1.42
+- ~--agent-teams~ convenience flag added in v2.1.45

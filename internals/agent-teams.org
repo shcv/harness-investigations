@@ -3,19 +3,26 @@
 
 * Feature Gating
 
-Two-layer gate at line 114895 of =pretty-v2.1.42.js=:
+Two-layer gate (line references from =pretty-v2.1.68.js=):
 
 #+begin_src javascript
-function l8() {
-  if (!$6(process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS)) return false;
-  if (!D8("tengu_amber_flint", true)) return false;  // server-side flag
+// M7() at line 162799
+function M7() {
+  if (!$6(process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS) && !Kp5()) return false;
+  if (!D8("tengu_amber_flint", true)) return false;
   return true;
+}
+
+// Kp5() at line 162796
+function Kp5() {
+  return process.argv.includes("--agent-teams");
 }
 #+end_src
 
 - =$6()= checks for truthy env var (=CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1=)
+- =Kp5()= checks for ~--agent-teams~ CLI flag (added v2.1.45)
 - =D8("tengu_amber_flint", true)= checks the server-side feature flag with a default of =true=
-- All team tools (TeamCreate, TeamDelete, SendMessage) call =l8()= in their =isEnabled()= method
+- All team tools (TeamCreate, TeamDelete, SendMessage) call =M7()= in their =isEnabled()= method
 - Task tools have their own gate: =GH()= checks =CLAUDE_CODE_ENABLE_TASKS= env var
 
 When teammates are spawned, the parent process explicitly sets the env var:
@@ -168,11 +175,21 @@ Three backend paths determined by =ot()= at line 398314:
 
 ** Backend Detection Priority
 
+When ~--teammate-mode~ is ~"auto"~ (default):
+
 1. *Already inside tmux* -> use tmux (native, =needsIt2Setup: false=)
 2. *In iTerm2 with it2 CLI* -> use iTerm2 (native)
 3. *In iTerm2 without it2* -> use tmux (fallback, =needsIt2Setup: true=)
 4. *Has tmux available* -> use tmux (external session)
 5. *None available* -> error with install instructions
+
+The ~--teammate-mode~ flag (or ~teammateMode~ in settings) overrides detection:
+- ~"tmux"~ -- force tmux backend
+- ~"in-process"~ -- force in-process (no terminal)
+- ~"auto"~ -- use detection priority above
+
+Captured once at startup by =nc6()= (line 415676) and propagated to child
+teammates via the spawn command.
 
 ** Spawn: iTerm2 / tmux Split Pane (=SCY()= at line 399103)
 
@@ -189,7 +206,13 @@ Three backend paths determined by =ot()= at line 398314:
 --plan-mode-required          # if applicable
 --agent-type {type}           # if custom agent
 --model {model}               # if override
+--teammate-mode {mode}        # tmux/in-process/auto
 #+end_src
+
+All flags are hidden from =--help=. Validation at line 598451 enforces that
+=--agent-id=, =--agent-name=, and =--team-name= must all be present if any one is.
+No validation against the team config on disk -- the process trusts the flags
+and calls =setDynamicTeamContext()= (line 598458).
 
 ** Spawn: tmux Window (=hCY()= at line 399238)
 
@@ -398,4 +421,9 @@ function IRA(name, teamName) {
 | v2.1.23 | "Swarm" renamed to "team" in UI                     |
 | v2.1.31 | Plan eligibility check before team operations        |
 | v2.1.33 | TeamCreate/TeamDelete tools, hooks                   |
-| v2.1.42 | Current version analyzed                             |
+| v2.1.42 | Previous analysis version                            |
+| v2.1.45 | ~--agent-teams~ CLI flag added                       |
+| v2.1.47 | TeammateTool and delegate mode removed               |
+| v2.1.64 | Hook blocking for TaskCompleted/TeammateIdle         |
+| v2.1.66 | ~forkContext~ for sub-agent context inheritance       |
+| v2.1.68 | Current version analyzed                             |

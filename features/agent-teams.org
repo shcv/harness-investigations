@@ -8,11 +8,13 @@ agent to spawn and orchestrate multiple teammate agents working in parallel.
 Teams share a task list for work distribution and communicate via a file-based
 mailbox system.
 
-** Feature Status (v2.1.42)
+** Feature Status (v2.1.68)
 
 Enabled when *both* conditions are met:
-- Environment variable: ~CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1~
+- Environment variable: ~CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1~, *or* the ~--agent-teams~ CLI flag (added v2.1.45)
 - Feature flag: ~tengu_amber_flint~ (server-side, defaults enabled)
+
+The ~--agent-teams~ flag simply sets the env var internally.
 
 ** Already Documented Elsewhere
 
@@ -28,6 +30,10 @@ Key changelogs:
 - *v2.1.20* - SendMessageTool replaces old teammate messaging
 - *v2.1.23* - Terminology: "swarm" renamed to "team"
 - *v2.1.33* - TeamCreate/TeamDelete tools added, hooks added
+- *v2.1.45* - ~--agent-teams~ CLI flag added
+- *v2.1.47* - TeammateTool and delegate mode infrastructure removed
+- *v2.1.64* - TaskCompleted/TeammateIdle hooks can block continuation
+- *v2.1.66* - ~forkContext~ for sub-agent context inheritance
 
 * User-Facing Tools
 
@@ -115,26 +121,76 @@ Key team additions to the base task system:
 
 ** Spawning Teammates
 
-Teammates are spawned via the *Task tool* (not TeamCreate) with these parameters:
+Teammates are spawned via the *Agent tool* (not TeamCreate) with these parameters:
 
 #+begin_src javascript
-// Task tool call from team lead
+// Agent tool call from team lead
 {
   "name": "researcher",           // teammate's display name
   "prompt": "Research the auth system...",
   "team_name": "my-project",      // which team to join
-  "agent_type": "general-purpose", // or custom agent type
-  "plan_mode_required": true,      // optional: start in plan mode
+  "subagent_type": "general-purpose", // or custom agent type
+  "mode": "plan",                  // optional: start in plan mode
   "model": "sonnet",              // optional: model override
-  "cwd": "/path/to/work"          // optional: working directory
 }
 #+end_src
+
+** External Joining via CLI Arguments
+
+It is also possible to start a Claude process externally and have it join an
+existing team. The CLI accepts hidden flags for this purpose:
+
+#+begin_src bash
+claude --agent-id "my-agent@my-team" \
+       --agent-name "my-agent" \
+       --team-name "my-team" \
+       --agent-color "#ff0000" \
+       --parent-session-id "uuid" \
+       --plan-mode-required \
+       --agent-type "general-purpose" \
+       --teammate-mode "in-process"
+#+end_src
+
+All three of ~--agent-id~, ~--agent-name~, and ~--team-name~ must be provided
+together. These flags are hidden from ~--help~ output.
+
+*** How it works
+
+- The CLI calls ~setDynamicTeamContext()~ with the provided fields
+- *No validation* is performed against the team config on disk
+  - The team directory doesn't need to exist yet
+  - The agent isn't checked against the member roster
+- The externally-joined agent can read/write the shared mailbox and task list
+- However, it will *not* be registered in ~config.json~ unless the leader's spawn
+  flow handles that (which it does for leader-spawned teammates)
+- Other teammates won't discover external joiners via the config file unless
+  the config is manually edited
+
+*** Practical use
+
+This mechanism is how the leader spawns teammates internally: it constructs a
+shell command with these flags and runs it in a tmux pane or iTerm2 split. The
+leader then updates the team config post-spawn.
+
+For manual external joining, you would need to:
+1. Know the team name (inspect =~/.claude/teams/=)
+2. Use a valid agent ID format: ="{name}@{team}"=
+3. Manually add yourself to the config if you want to be discoverable
+
+*** ~--teammate-mode~ flag
+
+Controls how spawned sub-teammates are created:
+- ~"tmux"~ -- force tmux panes
+- ~"in-process"~ -- run teammates in-process (no terminal needed)
+- ~"auto"~ -- detect available backend (default)
+
+Also configurable via settings (~teammateMode~ key).
 
 ** Team Workflow
 
 1. Lead calls *TeamCreate* to establish the team
 2. Lead uses *TaskCreate* to define work items
-3. Lead spawns teammates via the *Task* tool
+3. Lead spawns teammates via the *Agent* tool
 4. Lead assigns tasks with *TaskUpdate* (~owner~ parameter)
 5. Teammates work on tasks, mark them completed
 6. Teammates go idle between turns (automatic notification to lead)
@@ -158,6 +214,9 @@ Two team-specific hook events available in settings:
 
 - *TeammateIdle* -- fires when any teammate finishes a turn
 - *TaskCompleted* -- fires when a task is marked completed
+
+Both hooks can now *block continuation* (v2.1.64) by returning a blocking
+response, surfacing messages like "TaskCompleted hook prevented continuation".
 
 * What's Not Documented Elsewhere
 
@@ -202,6 +261,13 @@ Teams need a terminal multiplexer to display teammates:
 - *In-process* -- no terminal required (teammates run as internal tasks)
 
 If neither iTerm2 nor tmux is available, the system offers install instructions.
+
+** Sub-Agent Context Forking (v2.1.66)
+
+Agent definitions (=.claude/agents/*.md=) can set ~forkContext: true~ in
+frontmatter. When enabled, spawned sub-agents receive the parent conversation
+context as read-only history, separated by a =### FORKING CONVERSATION CONTEXT ###=
+boundary. Requires ~model: inherit~ to avoid context length mismatch.
 
 ** Cost Model
 

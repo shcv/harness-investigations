@@ -2535,17 +2535,27 @@ Package: `{self.project.npm_package}`
         # Remove 'v' prefix if present
         version_spec = version_spec.lstrip("v")
 
-        # Handle shorthand notation
+        # Handle shorthand notation — resolve to the most recent version
+        # series that matches (e.g. "69" matches 2.1.69 before 1.0.69)
+        def resolve_shorthand(patch_num: str) -> Optional[str]:
+            """Find the highest version ending in .{patch_num}."""
+            candidates = [v for v in available_versions if v.endswith(f".{patch_num}")]
+            if candidates:
+                return max(candidates, key=version.parse)
+            return None
+
         if re.match(r"^\d+$", version_spec):
             # Single shorthand version like "69"
-            target = f"1.0.{version_spec}"
-            if target in available_versions:
+            target = resolve_shorthand(version_spec)
+            if target:
                 return [target]
         elif re.match(r"^\d+-\d+$", version_spec):
             # Range shorthand like "69-71"
             start_num, end_num = version_spec.split("-")
-            start_version = f"1.0.{start_num}"
-            end_version = f"1.0.{end_num}"
+            start_version = resolve_shorthand(start_num)
+            end_version = resolve_shorthand(end_num)
+            if not start_version or not end_version:
+                return []
             for v in available_versions:
                 if (
                     version.parse(start_version)
@@ -2557,7 +2567,9 @@ Package: `{self.project.npm_package}`
         elif re.match(r"^\d+-$", version_spec):
             # Open range shorthand like "69-"
             start_num = version_spec.rstrip("-")
-            start_version = f"1.0.{start_num}"
+            start_version = resolve_shorthand(start_num)
+            if not start_version:
+                return []
             for v in available_versions:
                 if version.parse(v) >= version.parse(start_version):
                     versions.append(v)
