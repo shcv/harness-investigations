@@ -39,6 +39,8 @@ from typing import List, Set, Optional, Tuple
 import requests
 from packaging import version
 
+import bun_extract
+
 # Try to load .env file if python-dotenv is available
 try:
     from dotenv import load_dotenv
@@ -410,6 +412,59 @@ class ClaudeCodeSync:
         required_set = set(required_prefixes)
         return {ver for ver, found in version_files.items() if found >= required_set}
 
+    def _extract_from_platform_binary(self, version_str: str) -> bytes:
+        """Download the linux-x64 sibling package and extract cli.js from its Bun binary.
+
+        The embedded JS is platform-agnostic (same bundle in every platform
+        package), so we always pull linux-x64 regardless of the host. Raises on
+        any failure; caller decides how to report.
+        """
+        platform_pkg = f"{self.project.npm_package}-linux-x64"
+        print_info(f"Fetching platform binary tarball for {platform_pkg}@{version_str}...")
+
+        url_result = run(
+            ["npm", "view", f"{platform_pkg}@{version_str}", "dist.tarball"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        tarball_url = url_result.stdout.strip()
+        if not tarball_url:
+            raise RuntimeError(f"no dist.tarball for {platform_pkg}@{version_str}")
+
+        platform_tgz = self.temp_dir / f"{platform_pkg.replace('/', '__')}-{version_str}.tgz"
+        print_info(f"Downloading {tarball_url} (~74 MB)...")
+        response = requests.get(tarball_url, stream=True)
+        response.raise_for_status()
+        with open(platform_tgz, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                fh.write(chunk)
+
+        platform_extract_dir = self.temp_dir / f"platform-{version_str}"
+        try:
+            with tarfile.open(platform_tgz, "r:gz") as tar:
+                # Binaries may be named "claude" (unix) or "claude.exe" (win).
+                bin_member = None
+                for candidate in ("package/claude", "package/claude.exe"):
+                    try:
+                        bin_member = tar.getmember(candidate)
+                        break
+                    except KeyError:
+                        continue
+                if bin_member is None:
+                    raise RuntimeError(
+                        f"no claude binary in {platform_pkg}@{version_str} tarball"
+                    )
+                tar.extract(bin_member, platform_extract_dir)
+                binary_path = platform_extract_dir / bin_member.name
+
+            print_info("Extracting embedded JS bundle from Bun binary...")
+            project_root = Path(__file__).resolve().parents[1]
+            return bun_extract.extract_cli_js(binary_path, project_root)
+        finally:
+            platform_tgz.unlink(missing_ok=True)
+            shutil.rmtree(platform_extract_dir, ignore_errors=True)
+
     def download_version(self, version_str: str) -> bool:
         """Download a specific version from npm. Returns True on success."""
         print(f"\n--- Downloading version {version_str} ---")
@@ -466,6 +521,25 @@ class ClaudeCodeSync:
                     except KeyError:
                         # File not in archive, skip (only warn if no files extracted at end)
                         continue
+
+            # v2.1.113+ of claude-code ships the main npm package as a thin
+            # wrapper and puts the real CLI inside a Bun-compiled binary in a
+            # sibling platform package. When we see an empty extraction, try
+            # pulling the linux-x64 sibling and extracting the embedded JS.
+            if (
+                files_extracted == 0
+                and self.project.npm_package == "@anthropic-ai/claude-code"
+            ):
+                try:
+                    js_bytes = self._extract_from_platform_binary(version_str)
+                    original_file = self.original_dir / f"cli-v{version_str}.js"
+                    print_info(f"Saving: {original_file.name}")
+                    original_file.write_bytes(js_bytes)
+                    files_extracted = 1
+                except Exception as platform_err:
+                    print_warning(
+                        f"Platform-binary fallback failed for {version_str}: {platform_err}"
+                    )
 
             if files_extracted == 0:
                 print_warning(f"No files found in tarball for version {version_str}")
@@ -665,7 +739,10 @@ class ClaudeCodeSync:
             print(f"\n--- Prettifying {prefix} version {version_str} ---")
 
         try:
-            # Run prettier with babel parser and custom ignore-path to handle gitignored files
+            # Run prettier with babel parser and custom ignore-path to handle gitignored files.
+            # Bun-compiled bundles (v2.1.113+) exceed Node's default ~1.8 GB heap during
+            # prettier's format pass, so bump the heap for the subprocess.
+            prettier_env = {**os.environ, "NODE_OPTIONS": "--max-old-space-size=4096"}
             result = run(
                 [
                     "prettier",
@@ -678,6 +755,7 @@ class ClaudeCodeSync:
                 capture_output=True,
                 text=True,
                 check=True,
+                env=prettier_env,
             )
 
             # Write output to pretty file
