@@ -1,132 +1,186 @@
-#+TITLE: Claude Code Investigations
+#+TITLE: Harness Investigations
 
 * Overview
 
-This repository documents in-depth investigations into how Claude Code works internally and how to use it effectively.
-We analyze Claude Code's source code, features, and capabilities to understand its architecture and provide comprehensive documentation for advanced usage.
+Investigations into how AI coding harnesses work internally — Claude Code, the
+Claude Agent SDK, and OpenAI Codex — and how to use them effectively. We track
+released versions, generate diffs and changelogs, and publish documentation
+derived from reading the source.
+
+The repo started as =claude-investigations= focused on Claude Code, then grew
+to cover the Claude Agent SDK and Codex. The name reflects the broader scope.
 
 * Repository Structure
 
 #+begin_src
 .
-├── archive/             # Claude Code source versions
-│   └── changelog/       # Generated changelogs for each version
-├── tools/               # Archive management tools
-│   └── sync.py          # Automated sync tool for all operations
-├── docs/                # Guides and how-tos derived from experiments
-├── features/            # User-facing features and capabilities
-│   ├── background-shells.org
-│   ├── github-actions.org
-│   ├── mcp.org
-│   ├── hooks.org
-│   ├── keyboard-shortcuts.org
-│   ├── notifications.org
-│   ├── queued-prompts.org
-│   ├── thinking.org
-│   ├── settings.org
-│   ├── environment-variables.org
-│   ├── spinner-words.org
-│   └── security-review.org
-├── internals/           # Technical internals and protocols
-│   ├── websocket-protocol.org
-│   ├── diff-spec.org
-│   ├── session-log-format.org
-│   ├── microcompaction.org
-│   ├── recursion-stack.org
-│   ├── caching.org
-│   ├── telemetry.org
-│   └── root-detection.org
-└── CLAUDE.md           # Instructions for Claude Code when working here
+├── archive/
+│   ├── claude-code/        # @anthropic-ai/claude-code (npm)
+│   ├── claude-agent-sdk/   # @anthropic-ai/claude-agent-sdk (npm)
+│   └── codex/              # openai/codex (GitHub releases, Rust source)
+│       ├── original/       # raw downloads (npm projects only; gitignored)
+│       ├── pretty/         # prettier-formatted (npm projects only; gitignored)
+│       ├── source/         # git clone (GitHub projects only; gitignored)
+│       ├── diff/           # version-to-version diffs (gitignored)
+│       ├── changes/        # filtered diffs used as changelog input (gitignored)
+│       └── changelog/      # generated changelogs + system-prompt.md (committed)
+├── tools/                  # Sync, diffing, changelog, and posting tools
+├── docs/                   # Guides and how-tos derived from experiments
+├── features/               # User-facing features and capabilities
+├── internals/              # Technical internals and protocols
+├── experiments/            # Self-contained experiment runs
+├── reports/                # Aggregated findings
+└── refs/                   # Vendored reference material (gitignored)
 #+end_src
 
-* Understanding Claude Code Features
+Only changelogs, system prompts, and documentation are committed. Source
+archives and diffs are gigabytes and live on disk locally.
+
+* Documentation Index
 
 ** User-Facing Features (=features/=)
-- [[./features/settings.org][Settings]] - Multi-layered configuration system
-- [[./features/mcp.org][MCP]] - Model Context Protocol for tool extensions
-- [[./features/github-actions.org][GitHub Actions]] - CI/CD integration
-- [[./features/background-shells.org][Background Shells]] - Long-running command execution
-- [[./features/hooks.org][Hooks]] - Custom command triggers
-- [[./features/security-review.org][Security Review]] - Advanced vulnerability detection
-- [[./features/thinking.org][Thinking]] - AI reasoning optimization
-- [[./features/keyboard-shortcuts.org][Keyboard Shortcuts]] - Interactive mode navigation
-- [[./features/notifications.org][Notifications]] - Desktop alerts
-- [[./features/queued-prompts.org][Queued Prompts]] - Batch prompt execution
-- [[./features/environment-variables.org][Environment Variables]] - Configuration options
-- [[./features/spinner-words.org][Spinner Words]] - CLI animation customization
-
-** Guides and How-Tos (=docs/=)
-
-Practical techniques derived from experiments, with verified implementation details.
-
-- [[./docs/hook-subagent-detection.org][Hook Subagent Detection]] - Identify whether a hook is firing inside a subagent using transcript matching
-- [[./docs/best-practices.org][Best Practices]] - Lessons learned for designing and running experiments
-- [[./docs/evaluation-methods.org][Evaluation Methods]] - Approaches for measuring agent behavior
-- [[./docs/claude-agent-sdk-porting-guide.org][Agent SDK Porting Guide]] - Migrating between Claude SDK versions
+See [[./features/README.org][features/README.org]] for the full index. Highlights:
+- [[./features/settings.org][Settings]], [[./features/permissions.org][Permissions]], [[./features/plugins.org][Plugins]], [[./features/skills.org][Skills]]
+- [[./features/mcp.org][MCP]], [[./features/mcp-configuration.org][MCP Configuration]], [[./features/hooks.org][Hooks]]
+- [[./features/background-shells.org][Background Shells]], [[./features/queued-prompts.org][Queued Prompts]], [[./features/task-management.org][Task Management]]
+- [[./features/agent-teams.org][Agent Teams]], [[./features/agent-memory.org][Agent Memory]], [[./features/auto-memory.org][Auto Memory]], [[./features/agent-mailbox.org][Agent Mailbox]]
+- [[./features/thinking.org][Thinking]], [[./features/plan-mode.org][Plan Mode]], [[./features/output-styles.org][Output Styles]]
+- [[./features/remote-control.org][Remote Control]], [[./features/teleport.org][Teleport]], [[./features/websocket-sdk-streaming.org][WebSocket SDK Streaming]]
 
 ** Technical Internals (=internals/=)
-- [[./internals/websocket-protocol.org][WebSocket Protocol]] - MCP communication layer
-- [[./internals/session-log-format.org][Session Log Format]] - Conversation persistence
-- [[./internals/telemetry.org][Telemetry]] - Usage tracking and privacy
-- [[./internals/diff-spec.org][Diff Spec]] - Code change visualization
-- [[./internals/caching.org][Caching]] - Performance optimization
-- [[./internals/microcompaction.org][Microcompaction]] - Context optimization
-- [[./internals/recursion-stack.org][Recursion Stack]] - Task management
-- [[./internals/root-detection.org][Root Detection]] - Security measures
+See [[./internals/README.org][internals/README.org]]. Highlights:
+- [[./internals/websocket-protocol.org][WebSocket Protocol]], [[./features/stream-json-protocol.org][Stream JSON Protocol]]
+- [[./internals/session-log-format.org][Session Log Format]], [[./internals/microcompaction.org][Microcompaction]], [[./internals/recursion-stack.org][Recursion Stack]]
+- [[./internals/caching.org][Caching]], [[./internals/telemetry.org][Telemetry]], [[./internals/feature-flags.org][Feature Flags]]
+- [[./internals/diff-spec.org][Diff Spec]], [[./internals/model-aliases.org][Model Aliases]], [[./internals/llm-memory-retrieval.org][LLM Memory Retrieval]]
 
-* Workflow
+** Guides and How-Tos (=docs/=)
+- [[./docs/best-practices.org][Best Practices]] — designing and running experiments
+- [[./docs/evaluation-methods.org][Evaluation Methods]] — measuring agent behavior
+- [[./docs/hook-subagent-detection.org][Hook Subagent Detection]]
+- [[./docs/scripting-agent-teams.org][Scripting Agent Teams]]
+- [[./docs/external-task-injection.org][External Task Injection]]
+- [[./docs/claude-agent-sdk-porting-guide.org][Claude Agent SDK Porting Guide]]
+- [[./docs/why-org-mode.org][Why Org Mode]]
 
-** Analyzing New Versions
+* The Changelog System
 
-The `tools/sync.py` script automates the entire process of downloading, prettifying, diffing, and generating changelogs for Claude Code versions.
+=tools/sync.py= drives a multi-project pipeline that downloads each release,
+diffs it against the previous release, asks an LLM to summarize the change,
+and (optionally) posts the result to Discord forum threads.
 
-*** Quick Commands
+** Tracked Projects
+
+| Project          | Source                                | Notes                                     |
+|------------------+---------------------------------------+-------------------------------------------|
+| =claude-code=    | npm =@anthropic-ai/claude-code=       | Minified; uses [[https://github.com/shcv/astdiff][astdiff]] for diffs         |
+| =claude-agent-sdk= | npm =@anthropic-ai/claude-agent-sdk= | Extracts both =cli.js= and =sdk.mjs=      |
+| =codex=          | GitHub =openai/codex= (=rust-v*= tags)| Rust source under =codex-rs/=, plain diff |
+
+Project definitions live in the =PROJECTS= dict near the top of =tools/sync.py=.
+
+** One-Time Setup
+
+1. Python deps:
+   #+begin_src bash
+   pip install requests packaging python-dotenv claude-agent-sdk
+   #+end_src
+
+2. Node tools (for npm-based projects):
+   #+begin_src bash
+   npm install -g prettier
+   #+end_src
+
+3. Optional but recommended for Claude Code / Agent SDK diffs:
+   #+begin_src bash
+   # https://github.com/shcv/astdiff — semantic JS-aware diff
+   cargo install --git https://github.com/shcv/astdiff
+   #+end_src
+
+4. Authenticate the harness used for changelog generation. =sync.py= calls
+   =claude-agent-sdk='s =query()= against an isolated config dir at
+   =~/.claude/projects/harness-investigations/= so its sessions don't pollute
+   =--resume= and ccusage groups them under that name. =.credentials.json=
+   and =settings.json= are symlinked in from =~/.claude= on first run.
+
+5. Discord posting (optional). Copy the example config and edit:
+   #+begin_src bash
+   cp tools/config.py.example tools/config.py
+   #+end_src
+   Webhook URLs go in =config.py= (gitignored). Each webhook subscribes to one
+   or more channels (=claude-code=, =codex=, ...).
+
+** Running
+
+=sync.py= takes =--project= plus phase flags. The phases run in order;
+=--all= turns on every phase end-to-end.
 
 #+begin_src bash
-# Download and process all new versions
-python tools/sync.py --all
+# Just download new releases for the default project (claude-code)
+python tools/sync.py
 
-# Process only the latest version
-python tools/sync.py --all --latest
+# Full pipeline for one project
+python tools/sync.py --project codex --all
 
-# Generate changelogs for versions since v1.0.70
-python tools/sync.py --changelog --since v1.0.70
+# Latest release only
+python tools/sync.py --project claude-code --all --latest
 
-# Redo changelog for a specific version (creates iteration -2, -3, etc.)
-python tools/sync.py --redo 69 --changelog
+# Backfill from a specific version
+python tools/sync.py --project claude-code --changelog --since v2.0.0
 
-# Process versions in chronological order
-python tools/sync.py --all --oldest-first
+# Newest first (instead of chronological)
+python tools/sync.py --project codex --all --new-first
+
+# Redo a single version's changelog (creates iteration -2, -3, ...)
+python tools/sync.py --project claude-code --redo 2.0.37 --changelog
+
+# Discord post only (no regeneration)
+python tools/sync.py --project codex --post
 #+end_src
 
-*** Full Process Steps
+** Phase Flags
 
-1. **Download originals**: Fetches missing versions from npm
-2. **Prettify**: Formats files for readability using prettier
-3. **Generate diffs**: Creates diffs between consecutive versions (uses astdiff if available)
-4. **Generate changelogs**: Uses Claude SDK or CLI to analyze changes
+| Flag           | What it does                                                              |
+|----------------+---------------------------------------------------------------------------|
+| (none)         | Download missing originals into =archive/<proj>/original/= or =source/=   |
+| =--prettier=   | Run prettier over downloaded files (npm projects only)                    |
+| =--diff=       | Generate diffs between consecutive versions                               |
+| =--changes=    | Filter diff noise (version bumps, build paths, reformatting)              |
+| =--changelog=  | Ask the LLM for a changelog; implies =--changes=                          |
+| =--cleanup=    | Strip duplicate headers / meta-commentary from generated changelogs       |
+| =--post=       | Post new changelogs to Discord via webhook                                |
+| =--all=        | Enable all of the above                                                   |
 
-*** Manual Steps (if needed)
+Useful modifiers: =--latest=, =--since VERSION=, =--new-first=, =--redo SPEC=,
+=--annotate= (Haiku pre-pass; expensive), =--astdiff-threads N=, =--dry-run=.
 
-Individual phases can be run separately:
-#+begin_src bash
-python tools/sync.py                    # Download only
-python tools/sync.py --prettier         # Download and prettify
-python tools/sync.py --prettier --diff  # Also generate diffs
-python tools/sync.py --changelog        # Generate changelogs from existing diffs
-#+end_src
+** What Lands in Git
 
-** Contributing Documentation
+Only =archive/<project>/changelog/= (which contains the system prompt and the
+generated changelogs). Everything else — originals, pretty files, diffs,
+changes, source clones, =.sync-temp-*=, =.env=, =tools/config.py=,
+=.last_posted_version_*= — is gitignored.
 
-1. Investigate a specific feature or internal mechanism
-2. Create or update documentation in appropriate =features/= or =internals/= directory
-3. Follow org-mode format for consistency
-4. Include code references with line numbers when applicable
-5. Submit PR with findings
+** Customizing the System Prompt
+
+The first =--changelog= run for a project writes a default system prompt to
+=archive/<project>/changelog/system-prompt.md=. Edit it to tune tone, depth, or
+focus; subsequent runs read the file you committed.
+
+* Contributing Documentation
+
+1. Investigate a feature or internal mechanism.
+2. Create or update the relevant org file under =features/=, =internals/=,
+   or =docs/=.
+3. Reference the source: include version, file path, and line numbers.
+4. Open a PR.
+
+See [[./CONTRIBUTING.org][CONTRIBUTING.org]] for style and process notes.
 
 * Resources
 
-- [[https://docs.anthropic.com/en/docs/claude-code][Official Claude Code Documentation]]
-- [[https://modelcontextprotocol.io/][Model Context Protocol Specification]]
+- [[https://docs.anthropic.com/en/docs/claude-code][Claude Code Documentation]]
 - [[https://github.com/anthropics/claude-code][Claude Code GitHub Repository]]
-- [[https://github.com/shcv/astdiff][astdiff]] - JavaScript-aware semantic diff tool (improves diff quality)
+- [[https://github.com/openai/codex][OpenAI Codex GitHub Repository]]
+- [[https://modelcontextprotocol.io/][Model Context Protocol Specification]]
+- [[https://github.com/shcv/astdiff][astdiff]] — semantic JS diff tool used for minified-bundle changelogs

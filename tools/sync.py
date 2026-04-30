@@ -55,14 +55,14 @@ except ImportError:
 def _get_isolated_claude_config() -> Path:
     """Return an isolated CLAUDE_CONFIG_DIR for SDK tasks.
 
-    Sessions are written to ~/.claude/projects/claude-investigations/projects/...
+    Sessions are written to ~/.claude/projects/harness-investigations/projects/...
     so ccusage finds them automatically (via **/*.jsonl) and groups them under
-    the project name "claude-investigations". They don't appear in --resume
+    the project name "harness-investigations". They don't appear in --resume
     because real project dirs start with '-' (hyphenated cwd paths); this dir
     does not.
     """
     user_claude = Path.home() / ".claude"
-    claude_dir = user_claude / "projects" / "claude-investigations"
+    claude_dir = user_claude / "projects" / "harness-investigations"
     claude_dir.mkdir(parents=True, exist_ok=True)
 
     for fname in (".credentials.json", "settings.json"):
