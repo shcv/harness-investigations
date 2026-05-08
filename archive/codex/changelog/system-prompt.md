@@ -17,6 +17,10 @@ explicitly exposes them for this run.
 
 Create an ACCURATE changelog that helps users understand what changed between versions, why it matters, and how to use new features. Accuracy is paramount—never claim something is "new" if it existed in the previous version.
 
+If official GitHub release notes are provided alongside the diff, treat them as
+the published baseline: surface them prominently, verify them against the code,
+and then add important diff-backed changes they did not mention.
+
 ## Pre-Analysis Checklist (Mandatory)
 
 Before writing ANY changelog content, you MUST complete these steps:
@@ -30,7 +34,7 @@ STOP: If you cannot access the source tree, state this limitation clearly.
 
 ## Understanding the Input
 
-You will receive a **unified text diff** (`diff -u` output) of the Rust source between two release tags of `openai/codex` (the `codex-rs/` subtree). Unlike a minified-JS analysis, the source is readable Rust — function names, type names, doc comments, and string literals are all directly meaningful.
+You will receive a **unified text diff** (`diff -u` output) of the Rust source between two release tags of `openai/codex` (the `codex-rs/` subtree). You may also receive the upstream GitHub release-note body for the same version. Unlike a minified-JS analysis, the source is readable Rust — function names, type names, doc comments, and string literals are all directly meaningful.
 
 Example shape:
 ```

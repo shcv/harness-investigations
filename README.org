@@ -107,7 +107,10 @@ Project definitions live in the =PROJECTS= dict near the top of =tools/sync.py=.
      on first run.
    - =--agent-provider codex= shells out to =codex exec= in read-only sandbox
      mode and writes the returned changelog itself. Authenticate with the normal
-     Codex CLI login first.
+     Codex CLI login first. For GitHub-backed projects such as Codex, the
+     pipeline also reads the upstream GitHub release notes and asks the model to
+     distinguish the published highlights from additional changes found in the
+     repo diff.
 
    You can set the default in =.env=:
 
@@ -181,6 +184,10 @@ Only =archive/<project>/changelog/= (which contains the system prompt and the
 generated changelogs). Everything else — originals, pretty files, diffs,
 changes, source clones, =.sync-temp-*=, =.env=, =tools/config.py=,
 =.last_posted_version_*= — is gitignored.
+
+For GitHub-backed projects, bad tag fetches and bad tag-to-tag diffs now fail
+hard instead of being treated as empty changes. When =notify-send= is available,
+hard failures also trigger a best-effort desktop notification.
 
 ** Customizing the System Prompt
 

@@ -35,7 +35,7 @@ from dataclasses import dataclass
 import tempfile
 from pathlib import Path
 from subprocess import run
-from typing import List, Set, Optional, Tuple
+from typing import Any, Dict, List, Set, Optional, Tuple
 import requests
 from packaging import version
 
@@ -175,7 +175,7 @@ class ClaudeCodeSync:
     """Main sync tool implementation"""
 
     # Default changelog system prompt
-    DEFAULT_CHANGELOG_PROMPT = """Give me a changelog based on the diff provided in the prompt. Return only the changelog contents. Be detailed and clear in your explanations. Investigate the newer file as needed. Focus on and prioritize user-facing (interactive and cli argument) features. If there is a new command, argument, flag, or other user-facing feature, give explanations and examples for how a user could use it. Note that this is an interactive CLI application, not a library; user's won't interact with the code directly, so present usage from the perspective of an interaction or command-line arguments, not function calls. If you want to explain the code, reproduce the relevant snippet with semantic names."""
+    DEFAULT_CHANGELOG_PROMPT = """Give me a changelog based on the diff provided in the prompt. Return only the changelog contents. Be detailed and clear in your explanations. Investigate the newer file as needed. Focus on and prioritize user-facing (interactive and cli argument) features. If official release notes are provided, summarize those first as the published baseline, then call out important diff-backed changes they omitted. If there is a new command, argument, flag, or other user-facing feature, give explanations and examples for how a user could use it. Note that this is an interactive CLI application, not a library; user's won't interact with the code directly, so present usage from the perspective of an interaction or command-line arguments, not function calls. If you want to explain the code, reproduce the relevant snippet with semantic names."""
 
     # Patterns for detecting version bump noise in astdiff output
     _VERSION_BUMP_RE = re.compile(r'VERSION:\s*"[^"]*"')
@@ -264,6 +264,10 @@ class ClaudeCodeSync:
         self._cleanup_module = None
         self._changelog_agent = None
         self._annotation_agent = None
+        self._tool_version = None
+        self._github_releases_cache: Optional[List[Dict[str, Any]]] = None
+        self._github_release_index: Dict[str, Dict[str, Any]] = {}
+        self._notify_send_path = shutil.which("notify-send")
 
     def setup_directories(self):
         """Create required directories"""
@@ -317,31 +321,185 @@ class ClaudeCodeSync:
         except Exception:
             return False
 
+    def _notify_failure(self, title: str, message: str) -> None:
+        """Best-effort desktop notification for hard failures."""
+        if not self._notify_send_path:
+            return
+
+        body = " ".join(message.strip().split())
+        if len(body) > 500:
+            body = body[:497] + "..."
+
+        try:
+            run(
+                [
+                    self._notify_send_path,
+                    "--urgency=critical",
+                    f"{self.project.name}: {title}",
+                    body,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    def _fetch_github_releases(self, force: bool = False) -> List[Dict[str, Any]]:
+        """Fetch and cache GitHub release metadata."""
+        if self._github_releases_cache is not None and not force:
+            return self._github_releases_cache
+
+        releases: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            api_url = (
+                f"https://api.github.com/repos/{self.project.github_repo}"
+                f"/releases?per_page=100&page={page}"
+            )
+            response = requests.get(
+                api_url,
+                headers={"Accept": "application/vnd.github+json"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            page_data = response.json()
+            if not page_data:
+                break
+            releases.extend(page_data)
+            if len(page_data) < 100:
+                break
+            page += 1
+
+        release_index: Dict[str, Dict[str, Any]] = {}
+        for release in releases:
+            tag_name = release.get("tag_name", "")
+            if not tag_name:
+                continue
+            release_index[tag_name] = release
+            if self.project.github_tag_prefix and tag_name.startswith(self.project.github_tag_prefix):
+                stripped = tag_name[len(self.project.github_tag_prefix):]
+                release_index[stripped] = release
+                if stripped.startswith("v"):
+                    release_index[stripped[1:]] = release
+            elif tag_name.startswith("v"):
+                release_index[tag_name[1:]] = release
+
+        self._github_releases_cache = releases
+        self._github_release_index = release_index
+        return releases
+
+    def _get_github_release(self, version_str: str) -> Optional[Dict[str, Any]]:
+        """Return GitHub release metadata for a version string."""
+        if self._github_releases_cache is None:
+            self._fetch_github_releases()
+
+        candidates = [version_str]
+        if not version_str.startswith("v"):
+            candidates.append(f"v{version_str}")
+        if self.project.github_tag_prefix:
+            candidates.append(f"{self.project.github_tag_prefix}{version_str}")
+            if version_str.startswith("v"):
+                candidates.append(
+                    f"{self.project.github_tag_prefix}{version_str[1:]}"
+                )
+
+        for candidate in candidates:
+            release = self._github_release_index.get(candidate)
+            if release:
+                return release
+        return None
+
+    def _has_local_git_tag(self, tag_name: str) -> bool:
+        """Return True when a tag exists locally."""
+        result = run(
+            [
+                "git",
+                "-C",
+                str(self.source_dir),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/tags/{tag_name}^{{}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+
+    def _ensure_local_git_tag(self, tag_name: str) -> None:
+        """Fetch a missing tag directly from origin and verify it exists locally."""
+        if self._has_local_git_tag(tag_name):
+            return
+
+        print_info(f"Fetching missing tag {tag_name}...")
+        result = run(
+            [
+                "git",
+                "-C",
+                str(self.source_dir),
+                "fetch",
+                "origin",
+                f"refs/tags/{tag_name}:refs/tags/{tag_name}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or not self._has_local_git_tag(tag_name):
+            stderr = result.stderr.strip() or result.stdout.strip() or "unknown git fetch error"
+            raise RuntimeError(
+                f"required tag {tag_name} is unavailable locally after fetch: {stderr}"
+            )
+
+    def _write_official_release_notes(self, version_str: str) -> Optional[Path]:
+        """Persist the published GitHub release notes for the changelog prompt."""
+        if not self.project.is_github_based:
+            return None
+
+        release = self._get_github_release(version_str)
+        if not release:
+            print_warning(
+                f"No GitHub release metadata found for v{version_str}; skipping official release-note input"
+            )
+            return None
+
+        release_notes_path = self.changes_dir / f"release-notes-v{version_str}.md"
+        title = release.get("name") or release.get("tag_name") or version_str
+        body = (release.get("body") or "").rstrip()
+        html_url = release.get("html_url") or ""
+        published_at = release.get("published_at") or "unknown"
+        tag_name = release.get("tag_name") or f"v{version_str}"
+
+        lines = [
+            f"# Official release notes for {title}",
+            "",
+            f"- repository: `{self.project.github_repo}`",
+            f"- tag: `{tag_name}`",
+            f"- published_at: `{published_at}`",
+        ]
+
+        if html_url:
+            lines.append(f"- url: {html_url}")
+
+        lines.extend(["", "## Published Notes", ""])
+        if body:
+            lines.append(body)
+        else:
+            lines.append("_No official release-note body was published for this release._")
+
+        release_notes_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return release_notes_path
+
     def get_github_releases(self) -> List[str]:
         """Get all available releases from GitHub, sorted oldest first by default"""
         print_info(f"Fetching all available releases from {self.project.github_repo}...")
 
         try:
-            # Use GitHub API to get releases.  Paginate explicitly — the default
-            # page size is 30, which silently truncates repos like openai/codex
-            # that have hundreds of releases (mostly prereleases that get
-            # filtered out below, hiding the issue further).
-            releases = []
-            page = 1
-            while True:
-                api_url = (
-                    f"https://api.github.com/repos/{self.project.github_repo}"
-                    f"/releases?per_page=100&page={page}"
-                )
-                response = requests.get(api_url)
-                response.raise_for_status()
-                page_data = response.json()
-                if not page_data:
-                    break
-                releases.extend(page_data)
-                if len(page_data) < 100:
-                    break
-                page += 1
+            # Use GitHub API to get releases. Paginate explicitly — the default
+            # page size is 30, which silently truncates repos like openai/codex.
+            releases = self._fetch_github_releases(force=True)
 
             # Extract version numbers from tag names, excluding pre-releases
             versions = []
@@ -605,14 +763,24 @@ class ClaudeCodeSync:
         else:
             print_info(f"Repository already cloned, fetching updates...")
             result = run(
-                ["git", "-C", str(self.source_dir), "fetch", "--tags"],
+                [
+                    "git",
+                    "-C",
+                    str(self.source_dir),
+                    "fetch",
+                    "origin",
+                    "--force",
+                    "+refs/tags/*:refs/tags/*",
+                ],
                 capture_output=True,
                 text=True,
             )
             if result.returncode != 0:
-                print_warning(f"Failed to fetch updates: {result.stderr}")
-            else:
-                print_success("Fetched latest tags")
+                message = result.stderr.strip() or result.stdout.strip() or "unknown git fetch error"
+                print_error(f"Failed to fetch tags: {message}")
+                self._notify_failure("tag fetch failed", message)
+                sys.exit(1)
+            print_success("Fetched latest tags")
 
         # Get the latest version to checkout
         if self.latest:
@@ -957,6 +1125,8 @@ class ClaudeCodeSync:
             # Use git diff between tags
             older_tag = f"{self.project.github_tag_prefix}{older_version}"
             newer_tag = f"{self.project.github_tag_prefix}{newer_version}"
+            self._ensure_local_git_tag(older_tag)
+            self._ensure_local_git_tag(newer_tag)
 
             # If source_subdir is specified, only diff that subdirectory
             path_spec = []
@@ -967,7 +1137,14 @@ class ClaudeCodeSync:
                 ["git", "-C", str(self.source_dir), "diff", older_tag, newer_tag] + path_spec,
                 capture_output=True,
                 text=True,
+                check=False,
             )
+
+            if result.returncode != 0:
+                stderr = result.stderr.strip() or result.stdout.strip() or "git diff returned a non-zero exit status"
+                raise RuntimeError(
+                    f"git diff failed for {older_tag}..{newer_tag}: {stderr}"
+                )
 
             # Write diff output (even if empty - that means no changes)
             with open(diff_file, "w", encoding="utf-8") as f:
@@ -983,6 +1160,10 @@ class ClaudeCodeSync:
 
         except Exception as e:
             print_warning(f"Diff generation failed for v{newer_version}: {e}")
+            self._notify_failure(
+                "diff generation failed",
+                f"v{newer_version}: {e}",
+            )
             diff_file.unlink(missing_ok=True)
             return False
 
@@ -1419,6 +1600,86 @@ class ClaudeCodeSync:
                 f"{self.agent_provider} agent is unavailable. Skipping {feature_name}: {e}"
             )
             return False
+
+    def _get_tool_version(self) -> str:
+        """Return a repo version string for changelog provenance."""
+        if self._tool_version is not None:
+            return self._tool_version
+
+        try:
+            result = run(
+                ["git", "-C", str(self.base_dir), "describe", "--always", "--dirty"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self._tool_version = result.stdout.strip()
+            else:
+                self._tool_version = "unknown"
+        except Exception:
+            self._tool_version = "unknown"
+
+        return self._tool_version
+
+    def _relative_display_path(self, path: Path) -> str:
+        """Render a repository-relative path when possible."""
+        try:
+            return str(path.relative_to(self.base_dir))
+        except ValueError:
+            return str(path)
+
+    def _append_generation_metadata(
+        self,
+        changelog_file: Path,
+        diff_file: Path,
+        filtered_diff_path: Optional[Path],
+        string_diff_path: Optional[Path],
+        official_release_notes_path: Optional[Path],
+        raw_diff_fallback: bool,
+    ) -> None:
+        """Append deterministic generation metadata to a changelog."""
+        primary_diff_path = filtered_diff_path or (diff_file if raw_diff_fallback else None)
+        if filtered_diff_path:
+            primary_diff_kind = "filtered astdiff"
+        elif raw_diff_fallback:
+            primary_diff_kind = "raw diff"
+        else:
+            primary_diff_kind = "unknown"
+
+        lines = [
+            "",
+            "---",
+            "",
+            "Generated with:",
+            f"- tool: `harness-investigations@{self._get_tool_version()}`",
+            f"- provider: `{self.agent_provider}`",
+            f"- model: `{self.changelog_model}`",
+        ]
+
+        if self.agent_provider == "codex" and self.codex_reasoning_effort:
+            lines.append(f"- reasoning effort: `{self.codex_reasoning_effort}`")
+
+        if primary_diff_path is not None:
+            lines.append(
+                f"- primary diff: `{self._relative_display_path(primary_diff_path)}` ({primary_diff_kind})"
+            )
+
+        if string_diff_path is not None:
+            lines.append(
+                f"- string diff: `{self._relative_display_path(string_diff_path)}`"
+            )
+
+        if official_release_notes_path is not None:
+            lines.append(
+                f"- official release notes: `{self._relative_display_path(official_release_notes_path)}`"
+            )
+
+        changelog_body = changelog_file.read_text(encoding="utf-8").rstrip()
+        changelog_file.write_text(
+            changelog_body + "\n" + "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
 
     def _ensure_prompt_file(self, directory: Path, filename: str, default_content: str, label: str):
         """Ensure a prompt file exists, creating it with defaults if missing."""
@@ -1899,8 +2160,21 @@ Batch {batch_id} of changes:
             # do NOT read content into memory (large diffs exceed ARG_MAX when
             # passed as a CLI argument by the SDK).
             filtered_diff_path = None
-            for ext in (".md", ".diff"):
-                candidate = self.changes_dir / f"changes-v{version_str}{ext}"
+            filtered_candidates: List[Path] = []
+            if iteration > 1:
+                filtered_candidates.extend(
+                    [
+                        self.changes_dir / f"changes-v{version_str}-{iteration}.md",
+                        self.changes_dir / f"changes-v{version_str}-{iteration}.diff",
+                    ]
+                )
+            filtered_candidates.extend(
+                [
+                    self.changes_dir / f"changes-v{version_str}.md",
+                    self.changes_dir / f"changes-v{version_str}.diff",
+                ]
+            )
+            for candidate in filtered_candidates:
                 if candidate.exists():
                     filtered_diff_path = candidate
                     break
@@ -1913,6 +2187,8 @@ Batch {batch_id} of changes:
                 string_diff_path = self.changes_dir / f"string-diff-v{version_str}.txt"
                 with open(string_diff_path, "w", encoding="utf-8") as f:
                     f.write(string_diff_output)
+
+            official_release_notes_path = self._write_official_release_notes(version_str)
 
             # When no pre-processed input is available (e.g. GitHub-based
             # projects like codex with use_astdiff=False and no pretty/ dir),
@@ -1942,6 +2218,27 @@ Batch {batch_id} of changes:
             # Build prompt using file references so the agent Reads them via tool
             # use rather than receiving them as CLI arguments (avoids ARG_MAX limit).
             cli_prompt_parts = [f"Generate a changelog for version {version_str}."]
+
+            if official_release_notes_path:
+                rel = official_release_notes_path.relative_to(self.base_dir)
+                cli_prompt_parts.append(f"""
+
+## Official Release Notes (Published Baseline)
+
+Read the file `{rel}` before reading the diff. It contains the public upstream
+release notes for this version.
+
+Use it as the baseline for the write-up:
+- If the file contains published notes, begin with `## Official Release Highlights`
+  and summarize those notes in your own words while verifying them against the
+  code changes.
+- Then make the value of this custom changelog explicit: add
+  `## Additional Changes Beyond Official Notes` for substantive user-facing
+  changes that appear in the diff but were not called out publicly.
+- Do not duplicate the same item in both places.
+- If the official note file says no notes were published, skip the official
+  highlights section and rely entirely on the diff.
+""")
 
             if annotation_summary:
                 cli_prompt_parts.append(f"""
@@ -2025,6 +2322,10 @@ Return the COMPLETE changelog markdown as your final answer.
 - Begin with `# Changelog for version {version_str}` followed by a blank line.
 - Then produce the FULL changelog body: per-feature `## Section` headings with
   explanations, examples, and evidence as described in the system prompt.
+- When official release notes are provided and non-empty, include
+  `## Official Release Highlights` before the custom diff-driven sections.
+- When you find important diff-backed changes the official notes missed, include
+  `## Additional Changes Beyond Official Notes`.
 - Do NOT edit files.
 - Do NOT return a summary, outline, or "here are the key changes" overview.
 - Do NOT wrap the changelog in a Markdown code fence.
@@ -2086,6 +2387,17 @@ Return the COMPLETE changelog markdown as your final answer.
                             f.write(changelog_content)
                         file_body = changelog_file.read_text(encoding="utf-8")
 
+                    if file_body.strip():
+                        self._append_generation_metadata(
+                            changelog_file,
+                            diff_file,
+                            filtered_diff_path,
+                            string_diff_path,
+                            official_release_notes_path,
+                            raw_diff_fallback,
+                        )
+                        file_body = changelog_file.read_text(encoding="utf-8")
+
                     last_reason = self._changelog_looks_broken(file_body, changes_lines)
                     if not last_reason:
                         break
@@ -2117,6 +2429,10 @@ per-feature explanations.
                     f"Changelog v{version_str} still broken after retry ({last_reason}); "
                     "leaving file in place but skipping cleanup/post"
                 )
+                self._notify_failure(
+                    "changelog validation failed",
+                    f"v{version_str}: {last_reason}",
+                )
                 return False
 
             print_success(f"Generated changelog for v{version_str}")
@@ -2133,6 +2449,10 @@ per-feature explanations.
 
         except Exception as e:
             print_warning(f"Changelog generation failed for v{version_str}: {e}")
+            self._notify_failure(
+                "changelog generation failed",
+                f"v{version_str}: {e}",
+            )
             changelog_file.unlink(missing_ok=True)
             return False
 
@@ -2243,7 +2563,12 @@ per-feature explanations.
                 content = f.read()
 
             if not self._looks_like_astdiff(content):
-                raw_changes_file = self.changes_dir / f"changes-v{version_str}.diff"
+                if iteration > 1:
+                    raw_changes_file = (
+                        self.changes_dir / f"changes-v{version_str}-{iteration}.diff"
+                    )
+                else:
+                    raw_changes_file = self.changes_dir / f"changes-v{version_str}.diff"
                 raw_changes_file.write_text(content)
                 print_info(
                     f"Diff for v{version_str} is not astdiff format; "
