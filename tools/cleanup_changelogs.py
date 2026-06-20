@@ -249,7 +249,9 @@ def collapse_empty_sections(content: str) -> Tuple[str, bool]:
         line = lines[i]
 
         # Check if this is a section header (## or ###)
-        if re.match(r'^#{2,3}\s+', line):
+        header_match = re.match(r'^(#{2,3})\s+', line)
+        if header_match:
+            level = len(header_match.group(1))
             # Look ahead to see if there's content before next header or end
             j = i + 1
             has_content = False
@@ -263,7 +265,14 @@ def collapse_empty_sections(content: str) -> Tuple[str, bool]:
                     continue
 
                 # Check if we hit another header
-                if re.match(r'^#{1,3}\s+', next_line):
+                next_header = re.match(r'^(#{1,6})\s+', next_line)
+                if next_header:
+                    # A deeper heading is a sub-section — i.e. this header's
+                    # content. Only a same-or-shallower heading means this
+                    # section truly has no body (e.g. "## New Features" whose
+                    # only content is "### Feature" must be kept).
+                    if len(next_header.group(1)) > level:
+                        has_content = True
                     break
 
                 # Check if we hit a horizontal rule (section separator)

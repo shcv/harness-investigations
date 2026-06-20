@@ -26,27 +26,6 @@ def _tail(text: str, max_chars: int = 4000) -> str:
     return text[-max_chars:]
 
 
-def get_isolated_claude_config() -> Path:
-    """Return an isolated CLAUDE_CONFIG_DIR for SDK tasks.
-
-    Sessions are written to ~/.claude/projects/harness-investigations/projects/...
-    so ccusage finds them automatically and groups them under the project name
-    "harness-investigations". They do not appear in --resume because real
-    project dirs start with hyphenated cwd paths; this dir does not.
-    """
-    user_claude = Path.home() / ".claude"
-    claude_dir = user_claude / "projects" / "harness-investigations"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-
-    for fname in (".credentials.json", "settings.json"):
-        src = user_claude / fname
-        dst = claude_dir / fname
-        if src.exists() and not dst.exists():
-            dst.symlink_to(src)
-
-    return claude_dir
-
-
 @dataclass(frozen=True)
 class AgentRunRequest:
     prompt: str
@@ -86,8 +65,15 @@ class ClaudeSdkRunner(BaseAgentRunner):
     def run(self, request: AgentRunRequest) -> str:
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
+        # Use the caller's default CLAUDE_CONFIG_DIR (normally ~/.claude). We do
+        # NOT isolate the config dir: a separate dir needs its own credentials,
+        # and either a copy (goes stale) or a symlink (claude clobbers it on
+        # token refresh) ends up as a second credential store for the same
+        # account. Two stores doing independent OAuth refresh rotate the
+        # single-use refresh token out from under each other and log the user
+        # out. Session-list tidiness is handled by running the agent in a
+        # dedicated cwd instead (claude buckets sessions by cwd).
         env = dict(request.env or {})
-        env.setdefault("CLAUDE_CONFIG_DIR", str(get_isolated_claude_config()))
 
         kwargs = {
             "system_prompt": request.system_prompt,

@@ -19,6 +19,10 @@ refs/
 # Temp directory for sync tool
 .sync-temp/
 
+# Dedicated cwd for SDK agent runs (keeps their sessions out of the
+# personal session bucket; never holds real content)
+.agent-cwd/
+
 # Environment variables
 .env
 

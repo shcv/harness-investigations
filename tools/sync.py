@@ -259,6 +259,12 @@ class ClaudeCodeSync:
         self.changelog_dir = self.archive_dir / "changelog"
         self.changes_dir = self.archive_dir / "changes"
         self.temp_dir = base_dir / f".sync-temp-{project.name}"
+        # Dedicated working directory for SDK agent runs. claude buckets
+        # sessions by cwd, so running agents here keeps their JSONL sessions out
+        # of the user's personal session bucket for this repo (cwd=base_dir).
+        # Input/output files are passed to the agent as absolute paths, so the
+        # agent never needs to resolve anything relative to this dir.
+        self.agent_cwd = base_dir / ".agent-cwd"
 
         self.stats = SyncStats()
         self._cleanup_module = None
@@ -1705,12 +1711,21 @@ class ClaudeCodeSync:
         request = AgentRunRequest(
             prompt=prompt,
             system_prompt=system_prompt,
-            cwd=cwd or self.base_dir,
+            cwd=cwd or self._ensure_agent_cwd(),
             allowed_tools=allowed_tools,
             env=env,
             timeout=timeout,
         )
         return self._get_agent_runner(role).run(request)
+
+    def _ensure_agent_cwd(self) -> Path:
+        """Create and return the dedicated cwd for SDK agent runs.
+
+        Keeps agent sessions in their own cwd bucket (see self.agent_cwd) so
+        they don't clutter the user's personal session list for this repo.
+        """
+        self.agent_cwd.mkdir(parents=True, exist_ok=True)
+        return self.agent_cwd
 
     # ── Annotation pipeline (hybrid changelog mode) ───────────────────────────
 
@@ -1893,7 +1908,7 @@ Batch {batch_id} of changes:
                     output = runner.run(
                         AgentRunRequest(
                             prompt=prompt,
-                            cwd=self.base_dir,
+                            cwd=self._ensure_agent_cwd(),
                             allowed_tools=[],
                         )
                     )
@@ -2220,7 +2235,7 @@ Batch {batch_id} of changes:
             cli_prompt_parts = [f"Generate a changelog for version {version_str}."]
 
             if official_release_notes_path:
-                rel = official_release_notes_path.relative_to(self.base_dir)
+                rel = official_release_notes_path.resolve()
                 cli_prompt_parts.append(f"""
 
 ## Official Release Notes (Published Baseline)
@@ -2253,7 +2268,7 @@ completeness, as the annotations may miss some features.
 """)
 
             if filtered_diff_path:
-                rel = filtered_diff_path.relative_to(self.base_dir)
+                rel = filtered_diff_path.resolve()
                 cli_prompt_parts.append(f"""
 
 ## Code Changes (Filtered AST Diff)
@@ -2265,7 +2280,7 @@ feature detection. Use the Read tool with offset/limit if the file is large.
 """)
 
             if string_diff_path:
-                rel = string_diff_path.relative_to(self.base_dir)
+                rel = string_diff_path.resolve()
                 cli_prompt_parts.append(f"""
 
 ## String Literal Changes (AST-Extracted)
@@ -2276,7 +2291,7 @@ message changes, new settings, or renamed features.
 """)
 
             if raw_diff_fallback:
-                rel = diff_file.relative_to(self.base_dir)
+                rel = diff_file.resolve()
                 cli_prompt_parts.append(f"""
 
 ## Code Changes (Raw Unified Diff)
@@ -2288,7 +2303,7 @@ formatting-only or version-bump hunks.  Use the Read tool with offset/limit
 if the file is large.
 """)
 
-            rel_changelog = changelog_file.relative_to(self.base_dir)
+            rel_changelog = changelog_file.resolve()
             changelog_agent = self._get_agent_runner("changelog")
             agent_writes_file = changelog_agent.supports_file_write_tool
             if agent_writes_file:
@@ -2366,7 +2381,7 @@ Return the COMPLETE changelog markdown as your final answer.
                         cli_prompt,
                         system_prompt=system_prompt,
                         allowed_tools=allowed_tools,
-                        cwd=self.base_dir,
+                        cwd=self._ensure_agent_cwd(),
                         role="changelog",
                     )
 
