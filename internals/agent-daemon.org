@@ -1,0 +1,402 @@
+#+TITLE: Agent Daemon Runtime
+#+DATE: 2026-06-25
+
+* Overview
+
+[[file:agent-view.org][agent-view.org]] documents the full-screen =claude agents= TUI and the
+persisted job/session model it renders. This document covers the layer beneath
+it: the *daemon runtime* that actually executes background agents, keeps them
+alive after the launching terminal closes, and bridges terminals back to a
+running session.
+
+The short version:
+
+- Background agents run inside a *single per-user supervisor daemon* plus one
+  *PTY-host worker process per job*. Neither is the terminal you launched from.
+- The daemon is started *lazily and detached* (its own session via
+  =detached: true=), so closing the terminal does not kill it.
+- It can *only* be created by explicit user actions (=claude --bg=,
+  =/background=, the agent-view composer, =claude respawn=). *No in-session tool
+  call can create a background daemon job* — see [[#initiation-paths-can-a-tool-call-start-an-agent][Initiation Paths]].
+- For dispatch directory resolution and remote/cloud agents, see
+  [[#working-directory-resolution][Working Directory Resolution]] and [[file:remote-control.org][remote-control.org]].
+
+Primary source anchors (all line numbers from
+=archive/claude-code/pretty/pretty-v2.1.191.js= unless noted):
+
+- detached daemon spawn: =670693-670709= (=G1o=), =670928-670940= (=vW=)
+- per-job worker spawn: =833495-833522= (=WorkerHandle.spawn=)
+- PTY host: =706735-706872= (=runPtyHost=)
+- on-disk layout: =583608-584147=, =584134-584143= (socket dir)
+- lifecycle / idle exit: =833983-834015=, =834167-834169=
+- attach transport: =670268=, =670546-670561=
+- tool-vs-daemon boundary: =499361=, =499503=, =499830=
+
+* Process Model
+
+There are *three* kinds of process, and keeping them distinct is the key to
+understanding everything else.
+
+1. *Supervisor daemon* (registry =kind: "daemon"=). One long-lived process per
+   user. Owns the control socket, the lock file, the roster, and the dispatch
+   drop-box. Spawns and supervises workers. Does *not* run an agent itself.
+2. *Worker / PTY host* (=kind: "daemon-worker"=, plus a =--bg-pty-host=
+   subprocess). One per background job. Holds a virtual terminal (PTY) in which
+   the actual Claude session runs, and serves terminal bytes to any client that
+   attaches.
+3. *Client* (your interactive terminal). The =claude agents= TUI or
+   =claude attach= connects to the daemon to list, dispatch, reply, and stream
+   PTY bytes. The client is disposable; killing it leaves 1 and 2 running.
+
+This is why a row in the agent view is a *job/session*, not "an agent" — the
+job outlives any particular client and even survives the supervisor restarting
+(see [[#reconnect-and-re-adoption][Reconnect and Re-adoption]]).
+
+* On-Disk Layout
+
+The daemon spans two roots: a *persistent config root* under =~/.claude= and a
+*volatile socket root* under =/tmp= (or =$XDG_RUNTIME_DIR= / Termux equivalent).
+
+** Persistent config root (=~/.claude/=)
+
+Created via =Tde()= over =Zn()= (the global config dir):
+
+#+begin_example
+~/.claude/
+  daemon.lock          PID + origin lock; prevents duplicate daemons   (583608-583612)
+  daemon.json          supervisor config: which built-in workers to keep   (583716)
+  daemon.log           supervisor log file                             (583719)
+  daemon/
+    control.key        16-byte hex secret clients must present         (583950)
+    pipe.key           8-byte nonce for Windows named-pipe IDs         (584147)
+    roster.json        live session list, used for re-adoption         (584058)
+    dispatch/          drop-box: new-job dispatch files                (584052)
+    auth/              per-worker OAuth token cache                     (584064)
+#+end_example
+
+** Volatile socket root
+
+Built by =wde()= as =<tmp>/cc-daemon-<uid>/<sha256(configDir)[:8]>/=
+(=584134-584143=):
+
+#+begin_src javascript
+let e = process.getuid?.() ?? 0,
+  t = process.env.TERMUX_VERSION ? ... : "/tmp";
+return eh.join(t, `cc-daemon-${e}`, fgf()); // fgf = sha256 of config dir, 8 hex
+#+end_src
+
+#+begin_example
+<tmp>/cc-daemon-<uid>/<hash>/
+  control.sock              primary IPC unix socket                    (584110)
+  rv/<short>.sock           per-session rendezvous socket              (584074)
+  pty/<short>.sock          per-session PTY bridge socket              (584081)
+  spare/<short>.pty.sock    pre-warmed spare PTY processes             (584087)
+#+end_example
+
+Two consequences worth noting:
+
+- The hash is over the *config dir*, not any job's cwd. So the daemon is
+  *per-user, project-agnostic*: jobs launched from different directories share
+  one daemon and one =control.sock=.
+- On Windows the IPC surface is a named pipe (=\\.\pipe\cc-daemon-...=,
+  =583947=) instead of a unix socket.
+
+* How The Daemon Is Spawned
+
+The daemon is *not* started at boot by default. It is launched lazily the first
+time a background job is dispatched or =claude agents= is opened, by =vW()=
+(=670862=). The actual detached spawn is =G1o()= (=670693=):
+
+#+begin_src javascript
+let o = V1o.spawn(e[0], e.slice(1), {
+  detached: !0,
+  stdio: ["ignore", "ignore", n ?? "ignore"],
+  windowsHide: !0,
+  env: t,
+});
+o.unref();
+#+end_src
+
+The argv (=670931-670938=) is:
+
+#+begin_example
+claude daemon run --origin transient --spawned-by <json{label,cwd,pid}>
+#+end_example
+
+** Transient vs service daemons
+
+The =--origin= value, recorded in =daemon.lock=, controls *displacement
+priority*:
+
+- =transient= — the default lazily-spawned daemon. Idle-exits, and yields to a
+  service daemon.
+- =service= — installed via =claude daemon install=, which runs
+  =systemctl --user enable --now com.anthropic.claude-daemon.service=
+  (=583784-583798=). Its unit =ExecStart= is
+  =<claude> daemon --json-path <p> --log-file <p> --origin service= (=583770=).
+  A service daemon does *not* idle-exit and can ask a transient one to yield via
+  an =op: "yield"= control message (=833824=).
+
+When a service daemon is installed, =vW()= prefers =systemctl --user restart=
+and only falls back to a transient spawn if the service does not respond within
+~5 seconds (=670883-670901=).
+
+* Terminal-Survival Mechanics
+
+Three overlapping mechanisms keep the supervisor alive when the launching
+terminal closes:
+
+1. *New session / detached process group.* =detached: true= (=670697=) calls
+   =setsid()= on Linux, putting the daemon in its own session and process group,
+   severing the controlling terminal. Closing the terminal therefore does *not*
+   deliver =SIGHUP= to the daemon.
+2. *No inherited terminal FDs.* All three stdio streams are =["ignore",
+   "ignore", "ignore"]= (or stderr to a log FD). Nothing ties the daemon to the
+   terminal's file descriptors. Logs go to =~/.claude/daemon.log=.
+3. *Parent does not wait.* =o.unref()= (=670705=) removes the child from the
+   spawning process's event loop, so the launching =claude= can exit
+   immediately.
+
+The PTY-host worker that actually runs the agent is a *child of the supervisor*,
+not of your terminal, so it is unaffected by the terminal closing.
+
+** The one real caveat: =logind KillUserProcesses=
+
+A *transient* daemon is still an ordinary user process. On Linux with
+=logind KillUserProcesses=yes=, logging out / SSH disconnect kills all the
+user's processes, daemon included. The code detects this and warns (=671150=):
+
+#+begin_quote
+logind KillUserProcesses=yes — SSH disconnect will kill the transient daemon and
+its background jobs. Run =loginctl enable-linger $USER= or =claude daemon
+install= to keep it alive across logout.
+#+end_quote
+
+So "survives the terminal closing" is unconditional locally, but "survives
+*logout / SSH disconnect*" requires either lingering or the systemd service.
+
+* Workers And The PTY Host
+
+When the supervisor dispatches a job it spawns a worker via
+=WorkerHandle.spawn()= (=833495=):
+
+#+begin_src javascript
+let t = c0c.spawn(
+  this.invocation.cmd,
+  [...this.invocation.prefixArgs, "--daemon-worker", this.kind],
+  { stdio: this.authManager
+      ? ["pipe", "pipe", "pipe", "ipc"]
+      : ["pipe", "pipe", "pipe"],
+    windowsHide: !0 });
+#+end_src
+
+Key points:
+
+- Workers are *not* detached. They are children of the supervisor with connected
+  pipes; if the supervisor dies, =startParentWatchdog= (=665911-665936=) polls
+  =process.ppid= and exits the worker.
+- The job's config is delivered over the worker's *stdin* as one JSON line
+  (=833514-833522=), then stdin is closed. The worker entry =runDaemonWorker=
+  (=665845=) reads stdin, validates, and runs.
+- The actual interactive Claude session runs inside a *PTY host* (=runPtyHost=,
+  =706735=) built on =Bun.Terminal=:
+
+#+begin_src javascript
+v = new Bun.Terminal({ cols: r, rows: o, data(N, O) { ... } });
+I = Bun.spawn([s, ...i], {
+  cwd: process.cwd(),
+  env: { ...process.env, TERM: "xterm-256color" },
+  terminal: v, windowsHide: !0, detached: !1,
+});
+#+end_src
+
+The PTY host keeps a scrollback ring buffer (=createRing=, =706734=) and listens
+on =pty/<short>.sock=, replaying recent output to any newly attached client
+(=706871-706872=). This is why re-attaching shows prior output rather than a
+blank screen.
+
+* Attach Transport
+
+=claude attach <id>= connects directly to =control.sock= (=670268=) and sends a
+JSON line (=670546-670561=):
+
+#+begin_src javascript
+V.write(Re({
+  proto: Zd, op: "attach",
+  short: e, auth: c,          // short id + control.key secret
+  cols: o, rows: s,
+  attachId: l, caps: VOf(),   // terminal capabilities
+}) + "\n");
+#+end_src
+
+The daemon acks with =\{ ok, op: "attach", via, tempo, state, decModes \}=, then
+the connection switches to a raw PTY bytestream proxied from the job's PTY host.
+Detaching uses the OSC sequence =\x1B_cc-daemon-detach\x1B\\= (=565038=). The
+canonical operator commands surfaced to users (=673574-673581=) are:
+
+#+begin_example
+claude agents          list sessions
+claude attach <id>     open in this terminal
+claude logs <id>       show recent output
+claude stop <id>       stop this session
+#+end_example
+
+* Lifecycle
+
+** Idle exit (transient only)
+
+The supervisor watches =leaseCount() + liveHandleCount()=. When both hit zero it
+arms a timeout (=833983-834015=): ~5s once a client has connected, ~50s on a
+cold start where no client ever connected (constants =h0c=5000=, =Ypm=50000= at
+=834167-834169=, =671161=). On fire it logs
+=idle <N>s with no clients — exiting= (=834005=). Service daemons skip this
+(=833987= guards on =origin !== "transient"=).
+
+** Self-upgrade
+
+Every 60s (=Kpm=60000=) the supervisor checks whether its own binary's mtime or
+symlink target changed (=g0c()=). If so it shuts down cleanly and returns
+=\{ upgradeDetected: true \}=; the caller restarts it (=833962-833978=). This is
+how a background fleet picks up a =claude= upgrade without manual restart.
+
+** Displacement
+
+A transient daemon that detects another daemon holding =daemon.lock= exits with
+=cause=displaced= (=834086-834099=).
+
+** Reconnect and re-adoption
+
+Because each PTY host owns its own =pty/<short>.sock=, a job survives the
+*supervisor* restarting. On startup the new supervisor reads =roster.json= and
+calls =X8.adopt()= on each entry (=832958-832976=), reconnecting to still-live
+PTY hosts. The user-facing hint (=584623=):
+
+#+begin_quote
+running =claude agents= restarts the daemon and re-adopts still-running
+sessions; run =claude daemon stop --any= to reap them instead
+#+end_quote
+
+* Initiation Paths: Can A Tool Call Start An Agent?
+
+This is the sharpest question for anyone modeling the system, and the answer is
+unambiguous in the source:
+
+*No in-session tool call can create a daemon-backed background job.*
+
+Every daemon job goes through =kJ()= (=673149=), which builds the job dir,
+writes =state.json= via =_1f()=, and dispatches to the daemon via =fNo()=
+(=672846=). =kJ()= is reached from exactly four initiators, *all human*:
+
+| Initiator                                  | Calls           | Daemon job? | Human-initiated? |
+|--------------------------------------------+-----------------+-------------+------------------|
+| =claude --bg= / =--background= [args]      | =b1f= → =kJ=    | yes         | yes (CLI)        |
+| =/background= (=/bg=) slash command        | =ftr= → =kJ=    | yes         | yes (types cmd)  |
+| agent-view composer (Enter)                | =Jer= → =kJ=    | yes         | yes (keypress)   |
+| =claude respawn <id>=                      | respawn → =kJ=  | yes         | yes (CLI)        |
+|--------------------------------------------+-----------------+-------------+------------------|
+| Agent tool =run_in_background: true=       | =yVe= (in-proc) | *no*        | model decision   |
+| Agent tool =isolation: "worktree"=         | =yVe= (in-proc) | *no*        | model decision   |
+| Agent tool =isolation: "remote"=           | cloud CCR       | *no*        | model decision   |
+| =TaskCreate= tool                          | task list only  | *no*        | model decision   |
+
+The boundary is enforced explicitly. =run_in_background: true= routes to =yVe()=
+(=499830=), a *purely in-process* async task runner that drives an API loop and
+posts progress back to the parent session — it never touches =kJ=/=fNo= or any
+socket. The in-process subagent dies when the parent CLI process exits. Two
+guards make the intent clear:
+
+- =499361=: "In-process teammates cannot spawn background agents. Use
+  run_in_background=false for synchronous subagents."
+- =499503=: "In-process teammates cannot spawn background agents. Agent
+  '...' has background: true in its definition."
+
+So the *only* way a model could end up creating a daemon job is indirectly, by
+calling the =Bash= tool to run =claude --bg ...= as an external process — which
+is ordinary process execution, not a tool API into the fleet.
+
+** =/background= is a detach, not a fresh spawn
+
+=ftr()= (=674804=) dispatches =kJ= with respawn flags =--resume <currentSession>
+--fork-session= (=674820=) and =source: "slash"= (=673297=), then exits the
+terminal (=Hi(0, "prompt_input_exit")=, =675031=). The *current conversation*
+moves to the daemon and continues; it is not a new session. This matches the
+command description: "Send this session to the background and free the
+terminal."
+
+** Routines / cron are still user-anchored
+
+Local routines re-dispatch via =Jer= with =["--routine", o]= flags
+(=672022=, =672354=), but the cron evaluation (=Gst()=, =265404=) runs inside
+the *agent-view process's* scheduled-task loop (=798141=), not the daemon. The
+daemon's own 60s interval only checks for binary upgrades. So a routine fires
+only while a human has the agent view (or a hosting session) open. Cloud
+routines are a different system entirely — see [[file:remote-control.org][remote-control.org]].
+
+* Working Directory Resolution
+
+When a plain prompt is typed into the agent-view composer (no =@token=), the new
+job's =cwd= is chosen as follows (=786029=, =ml = Li.cwd ?? z=):
+
+- *Grouped by state*: =z= is the realpath of the *process cwd* of the terminal
+  that opened the view (=Pt()=). The focused row is ignored.
+- *Grouped by directory*: =z= tracks the *focused row's origin directory*
+  (=originCwd=, via =oxe(job.state)=). With the cursor on a header or no jobs, it
+  falls back to the process cwd. (Selection logic: =785197-785204=.)
+
+At creation the dispatch payload writes =cwd= and =originCwd= *equal*
+(=672041-672042=).
+
+** =@token= directory override
+
+The composer parser =HGo= (=782596-782634=) rewrites =@name= tokens. A token
+resolves, in order, to: an agent template, a routine, or a *directory key*. The
+directory map (=784238-784244=) is built from two sources:
+
+1. *Sibling git repos* in the parent of the terminal's cwd, discovered by
+   =Z9l()= scanning for child dirs containing =.git= (=671951-671974=).
+2. *Origin directories of existing jobs* — the basename of each running job's
+   =originCwd=.
+
+So =@myrepo= dispatches into a sibling repo or an existing job's origin, if the
+basename matches. Unmatched =@tokens= are left in the prompt text.
+
+** =cwd= vs =originCwd=
+
+| Field       | Meaning                                                                 |
+|-------------+-------------------------------------------------------------------------|
+| =cwd=       | Actual process working directory *now*. Becomes the worktree path after =EnterWorktree=. Updated by =K2i()= on every =chdir= (=224997-225004=). |
+| =originCwd= | "Where it was launched from" / repo identity. Used for grouping (=oxe=, =225276=) and the =@repo= map. *Never* overwritten once a worktree exists. |
+
+Under =isolation: worktree=, both start equal at dispatch; once the session
+calls =EnterWorktree=, =cwd= becomes the worktree path while =originCwd= is
+preserved as the repo root, so the job stays in its repo's directory group even
+though it is running inside =.claude/worktrees/<branch>=.
+
+* Modeling Notes For A Custom Harness
+
+- The durable runtime is a *supervisor + per-job PTY host*, not a thread pool.
+  The PTY host is what makes "attach from any terminal and see scrollback" work.
+- Detachment is three things together: own session (=setsid=), no terminal FDs,
+  and parent =unref=. Missing any one re-couples the job to the terminal.
+- Keep the *client* disposable and the *runtime* durable. Re-adoption via a
+  roster file lets even the supervisor restart without losing jobs.
+- Draw a hard line between *in-process subagents* (tool-spawnable, ephemeral) and
+  *daemon jobs* (human-spawned, durable). Conflating them is the most likely
+  design error.
+- Idle-exit + self-upgrade + lingering are the operational details that decide
+  whether the "fleet" feels reliable or flaky in practice.
+
+* Source Map
+
+- Detached daemon spawn: =pretty-v2.1.191.js:670693-670709=, =670928-670940=
+- systemd service install: =pretty-v2.1.191.js:583770=, =583784-583798=
+- On-disk layout: =pretty-v2.1.191.js:583608-584147=, =584134-584143=
+- Worker spawn + stdin config: =pretty-v2.1.191.js:833495-833522=, =665845=
+- PTY host: =pretty-v2.1.191.js:706735-706872=
+- Attach transport + detach OSC: =pretty-v2.1.191.js:670268=, =670546-670561=, =565038=
+- Lifecycle (idle/upgrade/displace/adopt): =pretty-v2.1.191.js:833962-834099=, =832958-832976=
+- =KillUserProcesses= warning: =pretty-v2.1.191.js:671148-671152=
+- Tool-vs-daemon boundary: =pretty-v2.1.191.js:499361=, =499503=, =499830=
+- Dispatch =kJ=/=fNo=: =pretty-v2.1.191.js:673149=, =672846=
+- cwd resolution + parser: =pretty-v2.1.191.js:786029=, =782596-782634=, =784238-784244=
+- Related: [[file:agent-view.org][agent-view.org]] (TUI + job model), [[file:remote-control.org][remote-control.org]] (cloud + remote control)

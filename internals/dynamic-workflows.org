@@ -1,0 +1,469 @@
+#+TITLE: Dynamic Workflow System Internals
+#+DATE: 2026-06-23
+
+* Overview
+
+The /dynamic workflow system/ is Claude Code's engine for running user- (or
+model-) authored JavaScript *orchestration scripts* that spawn and coordinate
+many subagents deterministically. It is exposed to the model as a single tool,
+=Workflow=, and to the user through the =/workflows= slash command and a
+one-time usage-cost warning.
+
+The defining idea is a clean split of responsibilities:
+
+- The *script* expresses control flow — loops, conditionals, fan-out, fan-in —
+  in plain JavaScript using a small set of injected primitives (=agent()=,
+  =parallel()=, =pipeline()=, =phase()=, =log()=, nested =workflow()=) plus two
+  globals (=args=, =budget=).
+- The *engine* owns everything stateful and risky: spawning subagents, enforcing
+  structured output, capping concurrency and total agents, tracking a token
+  budget, journaling every step to disk, and replaying that journal on resume so
+  unchanged work returns instantly.
+
+The script never touches the network, the filesystem, or the host process
+scope. It runs inside a Node =vm= context with code generation disabled and
+communicates only through the injected hooks. This quarantine is what makes the
+system safe to hand a model-generated program.
+
+Primary source anchors (all line numbers are =pretty-v2.1.186.js=):
+
+- Script parser / validator =OC()= — =487704=
+- =meta= pure-literal evaluator =Tza()/Hza()= — =487754–487836=
+- Child-workflow runner / VM context builder =vza()= — =487865=, =require("vm")= at =488004=
+- Main engine factory =Fza()= (defines =agent/parallel/pipeline= hooks) — =488240=
+- =agent()= host hook =F= — =488314=
+- Journal class =Lho= and cache-key =Rza= — =488150–488195=
+- Snapshot persistence =Iza()/kza()= — =488035–488098=
+- Background launcher =Bho()= and Workflow tool =call()= — =489784=, =491740=
+- Tool definition + input schema =zBp= — =491505–491721=
+- Feature gate =uH()= — =174323=
+- =/workflows= view =zFl= and progress grouping =WBp= — =664814=, =491140=
+
+* Terminology And Release History
+
+The system shipped in *v2.1.146* and has been *opt-in and feature-gated from day
+one*. The first changelog to mention it (=changelog-v2.1.146.md=) describes it as
+"in development":
+
+#+begin_quote
+A new =Workflow= tool can run deterministic JavaScript orchestration scripts
+that spawn subagents, group them into phases, pipeline work, enforce structured
+outputs, and return cached results on resume. … The tool is disabled unless
+=CLAUDE_CODE_WORKFLOWS= is truthy, then additionally controlled by
+=tengu_workflows_enabled= with a default of true.
+#+end_quote
+
+Version markers across the archive:
+
+- *≤ v2.1.140*: no =Workflow= tool, no =meta= contract, no =resumeFromRunId=.
+- *v2.1.146*: tool name (=orchestrate subagents with deterministic JavaScript
+  workflow=), =export const meta= contract, and =resumeFromRunId= all appear
+  together.
+- *v2.1.150 → v2.1.186*: incremental hardening — additional =vm= contexts (nested
+  =workflow()=), throttle-vs-stall retry split (v2.1.146 changelog notes the
+  one-shot throttle backoff), and more resume call sites.
+
+Internally the tool is the =Workflow= tool (alias =RunWorkflow=); the task type
+is =local_workflow=; notifications and telemetry call the artifact a "Dynamic
+workflow". Treat all of these as the same subsystem.
+
+* System Model
+
+The feature is six cooperating layers:
+
+1. *Script contract* — a static gate. Before anything runs, the script is parsed
+   with Acorn, its =meta= block is validated as a pure literal, and the body is
+   scanned for nondeterminism.
+2. *Execution engine* — a Node =vm= context with the orchestration primitives
+   injected as context globals and a deep-clone marshalling layer at the
+   boundary.
+3. *Subagent dispatch* (=agent()=) — model/effort/agentType resolution, optional
+   git-worktree isolation, structured-output enforcement, and a per-attempt
+   stall watchdog with retries.
+4. *Concurrency and budget control* — counting semaphores, a lifetime agent cap,
+   an array-size cap, and a turn-token budget.
+5. *Journaling, caching, and resume* — every =agent()= call is keyed by a hash
+   chain and appended to a JSONL journal; resume replays the journal and only
+   re-runs from the first changed call onward.
+6. *Tool, UI, and lifecycle surface* — the =Workflow= tool launches the run in
+   the background as a =local_workflow= task; =/workflows= shows live progress;
+   completion/failure/kill emit =task-notification= messages.
+
+* The Script Contract
+
+** Required shape
+
+Every script must begin with a single statement:
+
+#+begin_src js
+export const meta = { name, description, title?, whenToUse?, phases? }
+#+end_src
+
+=OC()= (=487704=) parses the source with Acorn (=ecmaVersion: "latest"=,
+=sourceType: "module"=, await/return allowed outside functions). A parse failure
+returns an error that explicitly blames TypeScript syntax — the most common
+authoring mistake. The first body statement *must* be the =export const meta=
+declaration (=sBp()= at =487743=); anything else is rejected with
+"=export const meta … must be the FIRST statement=".
+
+** meta must be a pure literal
+
+=meta= is not executed — it is *statically evaluated from the AST* by =Tza()=
+(objects) and =Hza()= (values) at =487754–487798=. Allowed node types: literals,
+arrays (no sparse, no spread), nested object expressions, template literals with
+*no interpolation*, and a negative-number unary. Anything else — a variable, a
+function call, a spread, an interpolated template — throws "=meta must be a pure
+literal=". Reserved keys =__proto__/constructor/prototype= are blocked
+(=oBp= at =487840=). This guarantees the workflow's identity and phase plan can
+be read cheaply and safely (e.g. for the permission dialog and the saved-workflow
+registry) without running untrusted code.
+
+Validated fields (=aBp= at =487808=): =name= and =description= are required
+non-empty strings; =title=, =whenToUse= optional; =phases= is an array of
+={title, detail?, model?}= (=lBp= at =487822=). Everything after the =meta=
+statement is sliced off as the =scriptBody= (=487737=).
+
+** Determinism enforcement
+
+After =OC()=, =bza(scriptBody)= scans for =Date.now()=, =Math.random()=, and
+argless =new Date()= and rejects them (Workflow tool =validateInput=, errorCode
+4). This is mandatory because resume *replays the script* and matches calls by a
+deterministic hash — nondeterminism would shift the hash chain and silently break
+caching. The documented escape hatch is to pass timestamps via =args= or stamp
+results after the workflow returns.
+
+* Execution Engine
+
+The engine factory =Fza()= (=488240=) builds the hook set; =vza()= (=487865=)
+shows the full VM-context construction (used both for the top-level run and for
+nested =workflow()= calls). Key steps:
+
+1. =require("vm")= (=488004=) → =xWn.createContext(globals, { codeGeneration: {
+   strings: false, wasm: false } })= (=487921=). Disabling code generation means
+   the script cannot =eval= or =new Function= its way out.
+2. The injected context globals are: =budget=, =setTimeout=/=clearTimeout=
+   (engine-controlled timers), =phase=, =log=, =console= (a shim that routes
+   =log/info/debug/warn/error= to the narrator), then =agent=, =parallel=,
+   =pipeline=, =workflow=, and =args=.
+3. Values crossing the boundary are *deep-cloned*, not shared. A marshalling
+   clone function (=g=/=FGt=) copies args in and results out; a =WeakMap=
+   (=$= at =488313=, =b= in =vza=) caches the cloned form of a =schema= object so
+   repeated =agent()= calls with the same schema don't re-clone it.
+4. The compiled body runs with a wall-clock timeout (=runInContext(m, { timeout:
+   wWn })=, =487966=).
+
+Inside a *child* workflow (=vza=), two primitives are deliberately neutered:
+=phase()= is a no-op (=487914=) and =workflow()= rejects with "nesting is limited
+to one level" (=487945=). Children share the parent's =budget=, agent counter,
+concurrency pool, and abort signal.
+
+* The =agent()= Hook
+
+=agent(prompt, opts?)= is the workhorse (=F= at =488314=). It is wrapped in a
+concurrency limiter and does the following:
+
+** Label, phase, and counter
+
+- =label= defaults to the first 60 chars of the prompt, whitespace-collapsed
+  (=488336=); =opts.label= overrides.
+- =phase= defaults to =k=, the title of the last =phase()= call; =opts.phase=
+  overrides and =R(title)= maps it to a phase index for the progress UI
+  (=488340=).
+- =ne = ++c= (=488334=) is the lifetime agent counter, checked against the cap
+  before dispatch.
+
+** Model / effort / agentType resolution
+
+- =agentType= (=488461–488493=): looked up in the active agent definitions,
+  permission-checked, and used to build a modified definition that merges
+  =disallowedTools= and appends a system-prompt suffix. Without =agentType= the
+  default is the built-in =workflow-subagent= definition (=Pho=, or its schema
+  variant).
+- =effort= (=488505=): =opts.effort= string → numeric effort; inherits session
+  effort if omitted.
+- =model= (=488517=): resolution order is =CLAUDE_CODE_SUBAGENT_MODEL= env →
+  =opts.model= → the agentType's own default → the parent main-loop model. The
+  built-in Explore agent special-cases to a cheaper tier.
+
+** Worktree isolation
+
+=opts.isolation === "worktree"= (=488523=) creates a fresh git worktree named
+=wf-<n>= (or =<runId>-<n>=) *through a global concurrency-1 semaphore* (=b =
+Nit(1, oqe)=) — so two simultaneous worktree requests serialize on setup even
+though the agents themselves then run in parallel. The prompt is augmented with
+the worktree path, and on completion the worktree is removed if unchanged and
+preserved if it has edits.
+
+** Structured output enforcement
+
+When =opts.schema= is supplied:
+
+1. The JSON Schema is compiled with Ajv into a synthetic =StructuredOutput= tool
+   (=Trt= at =488497=); any pre-existing StructuredOutput tool is stripped and
+   replaced (=488515=). An invalid schema throws =TypeError= immediately.
+2. The subagent's system prompt gets a "you MUST call StructuredOutput exactly
+   once" suffix (=_Bp=). For custom =agentType= with a non-wildcard tool list,
+   =StructuredOutput= is also injected into that list.
+3. A =SubagentStop= hook (=Gdt=, =488609=) inspects the transcript: if the last
+   =StructuredOutput= call errored (schema mismatch) the agent is nudged to retry
+   — up to 2 in-conversation nudges, then an outer cap of
+   =MAX_STRUCTURED_OUTPUT_RETRIES= (default *5*) on validation-error turns
+   (=488634/488679=).
+
+With a schema, =agent()= returns the *validated object* (cloned out of the VM);
+without one it returns the concatenated final assistant text. A subagent that
+dies on a terminal API error returns =null= (so scripts =.filter(Boolean)=).
+
+** Stall watchdog and retries
+
+Each attempt arms a per-attempt stall timer (=488593=): =opts.stallMs ?? 180000=
+(3 min), reset on each query-progress event with a debounce floor of 10 % of
+=stallMs= (capped at 1 s). On fire it calls =abort("stalled")=. The dispatch loop
+retries a stalled agent up to *5 times* (=Pza=, =488911=), relabelling each as
+"=(retry N)=". A separate, narrower case — a *throttled* response (no stop
+reason, < 50 output tokens, long duration) — gets a single 45 s backoff retry
+instead of counting against the stall cap. A user-requested retry (via the UI)
+also consumes the same cap. Note this is distinct from the *async-agent* stream
+watchdog (=CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=, default 10 min, =~442710=) which
+governs long background agents generally and does not retry.
+
+* parallel() And pipeline() Semantics
+
+Both are implemented inside =Fza= (=parallel= ≈ =489130=, =pipeline= ≈ =489165=)
+on top of =Promise.allSettled=, so *neither call ever rejects* — a thrown or
+errored agent becomes =null= in the result array (budget-exceeded slots are
+counted separately; other failures are also pushed to the workflow failure list).
+
+- =parallel(thunks)= is a *barrier*: it awaits every thunk before returning a
+  same-length array. Use it only when stage N genuinely needs all of stage N-1
+  (dedup/merge, early-exit on zero, cross-item comparison).
+- =pipeline(items, ...stages)= has *no barrier between stages*: each item flows
+  through all stages independently and concurrently, so item A can be in stage 3
+  while item B is still in stage 1. A =null= from any stage short-circuits that
+  item's remaining stages. Wall-clock is the slowest single-item chain, not the
+  sum of slowest-per-stage — which is why it is the documented default for
+  multi-stage work.
+
+(The unrelated =pipeline()= near line 18301 is Zod's schema transform — easy to
+mistake when grepping.)
+
+* Concurrency And Resource Caps
+
+All caps are per-workflow-invocation closures inside =Fza=:
+
+- *Concurrent local agents*: semaphore =Nit(fBp, …)= where =fBp =
+  min(16, max(2, cpuCount - 2))= (=pBp= at =488231=). =Nit= is a counting
+  semaphore that queues excess calls and releases slots in =finally=. Excess
+  =agent()= calls queue and run as slots free up.
+- *Concurrent remote agents*: a separate semaphore capped at *50*.
+- *Lifetime total agents*: =c < 1000= checked before each dispatch (=Oza=); past
+  it, =agent()= throws =WorkflowAgentCapError= — a runaway-loop backstop whose
+  error text points at the classic cause (a =budget.remaining()= loop with no
+  budget set, where =remaining()= is =Infinity=).
+- *Array size*: a single =parallel()=/=pipeline()= accepts at most *4096* items
+  (=hWn=); more is an explicit error, not silent truncation.
+
+* Token Budget
+
+The =budget= global exposes =total= (the turn's configured target, or =null=),
+=spent()= / =getTurnSpent()=, and =remaining()=. The baseline is captured at
+launch (=b = W_() - Nbt()=) so =spent()= measures output tokens consumed *this
+turn across the main loop and all workflows* — the pool is shared, not
+per-workflow. The budget is a hard ceiling: once =getTurnSpent() >= total=, the
+next =agent()= throws =WorkflowBudgetExceededError= (caught and mapped to =null=
+inside =parallel/pipeline=). Scripts use it for dynamic scaling
+(=while (budget.total && budget.remaining() > 50_000)=).
+
+* Journaling, Caching, And Resume
+
+This is the system's most distinctive mechanism.
+
+** The journal
+
+Each run owns a JSONL journal at
+=<configDir>/<session>/subagents/workflows/<runId>/journal.jsonl= (=Lho=
+constructor, =488163=; dir from =Rte= at =488031=). Per =agent()= call two
+entries are appended (=Cpt.appendFile=, =488186=):
+
+- =started=: ={ type:"started", key, agentId }= — written at spawn (=488382=).
+- =result=: ={ type:"result", key, agentId, result }= — written at completion
+  (=488389=).
+
+Separately, a *snapshot* JSON for the whole run is written under
+=<configDir>/<session>/workflows/<runId>.json= via =Iza()= (=488035=) — this is
+what =/workflows= reads to list past runs (=kza()=, =488047=).
+
+** The hash-chain cache key
+
+Each call's key is computed by =Rza= (=488150=):
+
+#+begin_src text
+key = "v2:" + SHA256( previousKey + "\0" + prompt + "\0" + dBp(opts) )
+#+end_src
+
+=dBp= (=488120=) serializes only the cache-relevant opts —
+=schema/model/effort/isolation/agentType= — with functions omitted and arrays
+length-bounded, producing a stable string. Because each key folds in the
+*previous* call's key (=f= advances to =ie= at =488347=), the keys form a chain:
+changing call /N/'s prompt or opts changes /N/'s key and therefore every key
+after it.
+
+** Resume / longest-unchanged-prefix
+
+On =resumeFromRunId=, the journal is loaded (=Lho.load()=, =488166=) and reduced
+by =xza()= (=488108=) into ={ results: Map<key→entry>, started: Map }=. During
+replay (=488346=):
+
+#+begin_src js
+ie = Rza(se, te, f); f = ie;
+let de = m ? void 0 : l?.results.get(ie);   // m = "cache invalidated" flag
+if (de !== void 0) return ...p(de.result);  // cached → no spawn
+m = true;                                    // first miss → all later calls live
+#+end_src
+
+=m= starts =false=. The first call whose key is absent from =results= sets =m =
+true= permanently, so it and every subsequent call run live. This implements
+"longest unchanged prefix returns cached; first edited/new call and everything
+after runs live" *without* diffing scripts — the hash chain does it implicitly.
+Same script + same args ⇒ 100 % cache hit.
+
+** runId and scriptPath persistence
+
+=runId= is minted as =wf_= + 12 hex chars from =crypto.randomUUID()= (=491746=).
+Every inline-script invocation is also *auto-persisted*: =$Ei()= (=177975=) writes
+the script to =<configDir>/workflows/scripts/<slug>-<runId>.js= and the tool
+result returns that path plus the ready-to-paste resume call — which is how the
+model learns the path to edit and resume.
+
+* Named / Saved Workflows
+
+Beyond inline scripts, workflows can be invoked by =name=. The registry
+=getAllWorkflows= (=DLe=, =489587=) merges, in precedence order: project-scope
+=.claude/workflows/*.js= (shadows everything), then plugin workflows, then
+user-scope =~/.claude/workflows/*.js=, with built-ins filling gaps. In sandbox
+mode (=Ql("workflows")=) only built-ins load. =zGt(name, cwd)= resolves one by
+name. Saved files are the same =export const meta= + body format, written with
+mode =0o600= by =sxl()= (=627525=, fires =tengu_workflow_saved=). =meta.whenToUse=
+surfaces in listings and slash-command prompts; =title= is an optional display
+heading.
+
+* Tool Layer And Background Execution
+
+The =Workflow= tool (=zBp= schema, =491505=) accepts =script= / =scriptPath= /
+=name= (at least one required), plus =args=, =resumeFromRunId=
+(=/^wf_[a-z0-9-]{6,}$/=), and the ignored =title=/=description= (those come from
+=meta=). =validateInput= (=491625=) runs the gate checks, source resolution
+(=scriptPath= > =name= > =script=), =OC()= parse/meta validation, the
+determinism scan, and a guard against resuming a still-running runId.
+
+Crucially the tool is *asynchronous*: =call()= (=491740=) mints the runId,
+registers a =local_workflow= task, kicks off =Bho()= (=489784=) as a background
+IIFE, and *returns immediately* with ={ status:"async_launched", taskId,
+runId, scriptPath, transcriptDir, … }=. The workflow then runs to completion in
+the background; the model is re-invoked by a =task-notification= when it
+finishes.
+
+The default permission decision is *ask*, with the prompt "Review dynamic
+workflow before running"; the user also sees a one-time usage-cost warning
+(suppressible via =skipWorkflowUsageWarning=) noting that workflows "can use a
+lot of tokens quickly by running many subagents in parallel".
+
+* Progress UI (=/workflows=)
+
+=/workflows= (registered =665475=, =isEnabled: () => uH()=) opens =zFl=
+(=664814=), which merges live =local_workflow= tasks with past runs from
+=kza()=, sorted by start time, each row showing status, name, agent count,
+tokens, and duration. A detail view (=b8t=, =629058=) renders the progress tree.
+
+Phase grouping (=WBp=, =491140=) walks =meta.phases= in declaration order,
+case-insensitively prefix-matching each declared title to live groups and
+inserting placeholders for phases not yet started — so the planned phase
+structure is visible before any agent runs. =log()= output becomes
+=workflow_log= entries rendered as narrator lines above the tree; live progress
+state keeps at most =Sza = 500= entries, trimming oldest =workflow_log= entries
+first (=487484=). Agent rows show =label · model · tokens · tools · duration=
+with a tick/cross for done/error.
+
+* Notifications And Lifecycle
+
+The state-transition core is =CWn()= (=487514=): it acts only on a =running=
+task, aborts its controller, sets the terminal status and =endTime=, and
+schedules eviction for terminal states. Wrappers:
+
+- =Cho()= completed — writes the output file, telemetry =task_local_workflow=.
+- =IWn()= failed — clears journal, telemetry =..._failed=.
+- =v_e()= killed — clears journal and sends a "stopped" notification.
+- =eqe()= paused.
+
+=kWn()= (=487589=) builds the =task-notification= XML exactly once per task:
+=<status>=, a human =<message>=, =<result>= (truncated at 8000 chars, full result
+in the output file), =<failures>=, and =<usage>= with =agent_count=,
+=subagent_tokens=, =tool_uses=, =duration_ms=. On failure/kill it adds a
+=<recovery>= block with the =Workflow({scriptPath, resumeFromRunId})= resume hint
+and the transcript directory.
+
+Per-agent user actions route through =Aza()= (=487565=): it looks up the agent's
+controller in the task's =agentControllers= map and aborts it with reason
+=user-skip= (=WGt=) or =user-retry= (=qGt=), each with its own telemetry event.
+
+* Feature Flags And Gates
+
+The master gate is =uH()= (=174323=):
+
+#+begin_src text
+uH() = !uEn() && Js("allow_workflows") && n2r().available && (settings.enableWorkflows ?? n2r().defaultOn)
+#+end_src
+
+Controls:
+
+- =CLAUDE_CODE_DISABLE_WORKFLOWS= env or =settings.disableWorkflows= (=uEn=) —
+  hard off, trumps everything.
+- =allow_workflows= — scoped org/account permission.
+- =tengu_workflows_enabled= — statsig flag (default true); gates =available= and
+  =defaultOn=.
+- =CLAUDE_CODE_WORKFLOWS= env — forces the statsig value directly (truthy → on,
+  falsy → off). This is the documented opt-in switch.
+- =defaultOn= without env override = =Pi() !== "pro"= — i.e. off by default for
+  the Pro tier.
+- =settings.enableWorkflows= — per-user/session toggle (set via =/config=).
+- =settings.skipWorkflowUsageWarning= — suppresses the one-time cost warning.
+- =settings.workflowKeywordTriggerEnabled= — controls the "ultracode" keyword UI
+  suggestion.
+
+* Security Considerations
+
+- *Sandboxing*: scripts run in a Node =vm= context with =codeGeneration=
+  disabled (no =eval=/=new Function=) and no =require=/=process=/filesystem in
+  scope. All side effects flow through host-controlled hooks, and the
+  =setTimeout=/=clearTimeout= the script sees are engine-controlled timers.
+- *Boundary integrity*: every value crossing in/out is deep-cloned, and proxies
+  are detected (=$za.types.isProxy=, =488317=), so the script cannot smuggle live
+  host references or mutate host objects.
+- *Static safety on =meta=*: =meta= is evaluated from the AST, never executed, so
+  reading a workflow's identity/phase plan (for the permission dialog or
+  registry) runs no untrusted code. Prototype-pollution keys are blocked.
+- *Resource exhaustion guards*: concurrency semaphores, the 1000-agent lifetime
+  cap, the 4096-item array cap, the stall watchdog, and the hard token budget all
+  bound a runaway or adversarial script.
+- *Consent*: the tool defaults to "ask", and a one-time warning makes the
+  token-cost blast radius explicit before first use.
+
+* Evolution History
+
+- *v2.1.146* — system introduced, feature-gated behind =CLAUDE_CODE_WORKFLOWS= +
+  =tengu_workflows_enabled=; full primitive set (=agent/parallel/pipeline/phase/
+  log/budget/workflow=), =meta= contract, determinism enforcement, and
+  =resumeFromRunId=. Same release added a one-shot throttle backoff before giving
+  up on degraded throttle responses.
+- *v2.1.146 → v2.1.186* — incremental hardening: additional =vm= contexts for
+  nested =workflow()=, refinements to the resume/cache call sites, and the saved-
+  workflow registry across user/project/plugin scopes.
+
+The system remains opt-in as of v2.1.186; expect the gating defaults
+(=tengu_workflows_enabled=, the Pro-tier carve-out) to be the lever that controls
+general availability rather than further engine changes.
+
+* Source Reference
+
+All line numbers reference =archive/claude-code/pretty/pretty-v2.1.186.js=
+(=@anthropic-ai/claude-code= v2.1.186).

@@ -1,0 +1,621 @@
+#+TITLE: Agent View Internals
+#+DATE: 2026-05-13
+
+* Overview
+
+The recently released "agent view" is the full-screen =~claude agents~= TUI for
+managing background Claude Code sessions. The important architectural point is
+that it is not just a list UI. It is the main control plane for:
+
+- discovering live sessions
+- dispatching new background work
+- replying to running jobs
+- attaching back into terminals
+- stopping, respawning, pinning, renaming, and reordering jobs
+- reconciling daemon state, peer sessions, and persisted job metadata
+
+The feature was introduced in v2.1.119 under the internal and changelog name
+"fleet view", then gradually renamed in user-facing settings and policy surfaces
+to "agent view" by v2.1.139. The internal code still uses =fleet= in many
+places, so anyone porting this feature needs to treat =fleet view= and
+=agent view= as the same subsystem.
+
+Primary source anchors:
+
+- =archive/claude-code/changelog/changelog-v2.1.119.md=, "Fleet View (=claude agents=)"
+- =archive/claude-code/changelog/changelog-v2.1.133.md=, "Default Agents View"
+- =archive/claude-code/changelog/changelog-v2.1.139.md=, "Agent View Disable Setting Renamed"
+- =archive/claude-code/pretty/pretty-v2.1.119.js:594394-597040=
+- =archive/claude-code/pretty/pretty-v2.1.140.js:114931-115130=
+- =archive/claude-code/pretty/pretty-v2.1.140.js:163307-163344=
+- =archive/claude-code/pretty/pretty-v2.1.140.js:208720-209020=
+
+* Terminology And Release History
+
+- *v2.1.119* introduces the feature as *Fleet View* and describes it as a
+  full-screen TUI dashboard for background agent sessions. The same release
+  adds the daemon-backed lifecycle commands (=attach=, =kill=, =logs=, =rm=)
+  that make the view operational instead of purely informational.
+- *v2.1.133* adds =defaultToAgentsView=, letting a normal interactive startup
+  enter the agent view automatically when the gate is enabled.
+- *v2.1.139* renames the managed disable surface from
+  =disableAgentsFleet=/=CLAUDE_CODE_DISABLE_AGENTS_FLEET= to
+  =disableAgentView=/=CLAUDE_CODE_DISABLE_AGENT_VIEW=.
+
+The rename is only partial. In current source:
+
+- telemetry still emits =tengu_fleetview=
+- the open-heartbeat marker is still =.fleetview-heartbeat=
+- several helpers are still named =isAgentsFleetEnabled=,
+  =ensureFleetGateHydrated=, and =mountFleetView=
+
+That partial rename matters for a reimplementation because it shows the real
+boundary: the product surface says "agent view", but the implementation is still
+"background fleet management".
+
+* System Model
+
+At a high level the feature is made of five cooperating subsystems:
+
+1. *A persistent daemon-backed job runtime* that can spawn, reply to, stop,
+   and reattach to background sessions.
+2. *A persisted job-state store* keyed by short job IDs, used for list rows,
+   names, pins, sort order, worktree metadata, and session recovery.
+3. *A concurrent-session registry* keyed by PID, used to discover sessions
+   running in other terminals and to distinguish daemon-owned jobs from
+   peer-terminal sessions.
+4. *A full-screen TUI* that merges those data sources into one operator view.
+5. *A reconciliation layer* that repeatedly reconciles disk state, daemon
+   roster, peer liveness, PR metadata, and routine timing.
+
+The row the user sees in the UI is therefore not "an agent" in the abstract.
+It is a *job/session instance* with a backing transport and persisted state.
+The selected agent template is only one field in that instance.
+
+*Companion documents.* This file describes the TUI and the persisted
+job/session model. Two sibling docs cover the layers beneath and beside it:
+
+- [[file:agent-daemon.org][agent-daemon.org]] — the daemon *runtime*: where agents actually run, how the
+  detached supervisor + per-job PTY host are spawned, how jobs survive the
+  terminal closing, attach transport, lifecycle, working-directory resolution
+  for new dispatches, and the firm boundary that *no in-session tool call can
+  create a daemon job*.
+- [[file:remote-control.org][remote-control.org]] — the "remote" question: remote-controlling a *local*
+  session from claude.ai/mobile over an SSE bridge, versus running agents in
+  *Anthropic's cloud* (CCR / =isolation:"remote"= / =RemoteTrigger= / cloud
+  routines), plus push notifications and how these tie back into the daemon.
+
+* Entry Points And Feature Gates
+
+The latest gating path is in =pretty-v2.1.140.js:163307-163344=.
+
+#+begin_src javascript
+function u2H() {
+  return (
+    SH(process.env.CLAUDE_CODE_DISABLE_AGENT_VIEW) ||
+    GS()?.settings.disableAgentView === !0 ||
+    DN1()
+  );
+}
+
+function kc() {
+  return !u2H() && (Q7() || j$("tengu_slate_meadow", !1));
+}
+#+end_src
+
+Important gating behavior:
+
+- =CLAUDE_CODE_DISABLE_AGENT_VIEW= hard-disables the feature
+- managed settings can disable it with =disableAgentView=
+- the settings schema explicitly says this disables =claude agents=, =--bg=,
+  =/background=, and the on-demand daemon
+- the gate is hydrated asynchronously before startup chooses the default view
+
+The managed-settings schema text is at
+=pretty-v2.1.140.js:58107-58111= and is explicit that this is not only a TUI
+toggle; it also disables the surrounding background-session machinery.
+
+The default-open path is separate from the gate:
+
+- config UI toggle at =pretty-v2.1.140.js:504528-505057=
+- startup path at =pretty-v2.1.140.js:713472-713510=
+
+That startup path does:
+
+1. read =defaultToAgentsView=
+2. hydrate fleet/agent-view gating
+3. initialize logging/analytics/shutdown handling
+4. emit =tengu_fleetview=
+5. mount the full-screen view instead of the normal chat startup
+
+For a custom harness, the correct mental model is:
+
+- *gate* decides whether the background-session control plane exists at all
+- *defaultToAgentsView* only decides which UI opens first
+
+* User-Facing UI Spec
+
+** Overall Layout
+
+The release implementation in =pretty-v2.1.119.js:594394-597040= is a
+single-screen TUI with these regions:
+
+- *summary/header area* with current directory context and aggregate counts
+- *main grouped job list*
+- *bottom composer* for dispatching a new background session
+- *optional peek panel* for inline reply/details
+- *optional help footer*
+- *optional info footer*
+
+The empty state message is a strong product cue and should be preserved in any
+port:
+
+#+begin_example
+Agents here keep running even if you close this terminal - hand off a task and check back later.
+#+end_example
+
+That text appears at =pretty-v2.1.119.js:596380= and
+=pretty-v2.1.140.js:664813=.
+
+** Main List
+
+Each row is rendered from a persisted job plus live enrichments. The list can be
+grouped either by directory or by state.
+
+Directory grouping:
+
+- group key comes from the job's origin/current directory
+- current origin is sorted first
+- other origins are locale-sorted
+
+State grouping:
+
+- group buckets are =review=, =blocked=, =working=, =done=
+- pinned rows are forced into a synthetic =pinned= group above the others
+- groups sort in a fixed semantic order rather than alphabetically
+
+The grouping logic is in =pretty-v2.1.119.js:593839-593857= and the list
+assembly/sorting loop is in =pretty-v2.1.119.js:595198-596360=.
+
+** Row Contents
+
+The main row renderer is =$Y5()= at =pretty-v2.1.119.js:596896+=. A row can
+display:
+
+- a left status glyph with color derived from activity and backend status
+- the job label, from either user-assigned name or a derived/truncated intent
+- a detail line from =detail=, recent output, or last log tail line
+- a loop count marker like =xN= for routine-triggered jobs
+- PR badges/counts for child PRs
+- a right-aligned age or next-fire time
+- inline rename state
+- a delete confirmation marker (=delete?=)
+
+Visible row semantics that matter for a port:
+
+- label and detail are intentionally separate fields
+- the row prioritizes human-scannable current state over raw prompt text
+- PR/watcher jobs get extra artifacts in-line instead of forcing users into a
+  detail page
+- the row can represent both running daemon jobs and exited-but-respawnable jobs
+
+** Peek Panel
+
+The inline detail/reply surface is =oz5()= at
+=pretty-v2.1.119.js:594394-595198=.
+
+It provides:
+
+- the current detail/needs/output text
+- child PR rows with status/diff metadata
+- a reply composer
+- a two-mode input model: =prompt= mode and =bash= mode
+- an "open/attach" affordance when the reply box is empty
+
+Key interaction details:
+
+- the reply placeholder is =reply=
+- if the panel is in prompt mode and the input is empty, =right arrow= opens
+  the job
+- if the input starts bash mode, the border changes and the prompt prefix
+  becomes =!=
+- if the prompt is empty and not in bash mode, =space= closes the panel
+- =ctrl+x= inside the panel participates in the same delete/confirm flow as the
+  list
+
+This is important architecturally: the peek panel is not just a preview. It is
+an inline command surface for a live session.
+
+** Help Footer
+
+=KY5()= at =pretty-v2.1.119.js:596745-596777= exposes dynamic shortcuts based on
+context. The release implementation shows:
+
+- =shift+up/down= to reorder
+- =ctrl+r= to rename
+- =ctrl+s= to switch views
+- =ctrl+t= to pin/unpin
+- =?= to close help
+
+** Info Footer
+
+=fY5()= at =pretty-v2.1.119.js:596778-596960= is an implementation-oriented
+status pane for the focused job. It shows:
+
+- backend type
+- job dir path
+- cwd or worktree path
+- shell attach command for daemon-backed jobs
+- full session ID
+- producing CLI version, including mismatch warning
+- updated timestamp
+
+This footer is valuable because it exposes the transport and provenance layer,
+not just the UX state.
+
+** Composer And Dispatch Grammar
+
+The bottom composer is both a search box and a new-job dispatch surface.
+
+There are two separate parse passes:
+
+1. =aY4()= for *filter syntax* in the list
+2. =JE6()= for *dispatch syntax* when the input is treated as a new task
+
+Filter grammar from =pretty-v2.1.119.js:593861-593894=:
+
+- =a:<template>= filters by template/agent name
+- =s:<state>= filters by persisted or derived state
+- =o:<output>= filters by output text
+- =#123= or =/pull/123= filters by PR reference
+- remaining tokens become free-text search across name, intent, and output
+
+Dispatch grammar from =pretty-v2.1.119.js:593895-593939=:
+
+- =@name= can select an agent template
+- =@repo= can switch target cwd/origin
+- skill/routine-like names can map to a routine
+- unmatched input falls back to the default background agent template
+
+The composer also supports long-paste chunking in the main TUI loop. Large or
+multi-line pasted text is promoted into structured pending content instead of
+being shoved directly into a one-line buffer.
+
+* Interaction Model
+
+The main event loop is in =O34()= at
+=pretty-v2.1.119.js:595198-596360=. Important interactions:
+
+- =Enter= dispatches a new job, opens a job, or resumes one depending on state
+- =Space= opens the peek panel
+- =Right= opens the focused job
+- =Tab= toggles suggestions or applies the selected suggestion
+- =Ctrl+S= toggles grouping between directory and state
+- =Ctrl+T= pin/unpin
+- =Ctrl+R= rename
+- =Ctrl+X= arm delete, then confirm delete/stop
+- =Shift+Up/Down= reorder within a group
+- =Cmd/Meta+1-9= quick-open numbered jobs in the current origin
+- =Escape= progressively clears overlays, search, delete arm, and help
+- =Ctrl+C= exits the list, with special handling when jobs are still running
+
+The key behavioral point is that "open" is not the only primary action. A row
+can instead:
+
+- attach to a live daemon session
+- resume a failed/stopped session
+- reply inline
+- be pinned/reordered without opening
+
+* Internal Architecture
+
+** Core Entities
+
+The implementation uses several distinct entities that should remain distinct in
+any port.
+
+- *Agent/template definition*: static instructions, default prompt, isolation
+  rules, and when-to-use metadata.
+- *Job*: the persisted unit shown in the list. This is the row identity.
+- *Session*: the live runtime identity, usually a UUID. Jobs retain this even
+  when the runtime is temporarily absent.
+- *Short job ID*: first 8 chars of the session ID, used as the human-visible
+  handle and the job-directory key.
+- *Backend*: transport for a job. Current implementations are =daemon= and
+  =peer=.
+- *Concurrent session record*: per-process PID file describing any live Claude
+  terminal, not just daemon jobs.
+
+This distinction is the single most important modeling point. In agent view, an
+"agent" is usually a *template*, but the view is primarily built around *jobs*.
+
+** Concurrent Session Registry
+
+The concurrent-session registry lives under =~/.claude/sessions/{pid}.json= and
+is written by =Kaq()= at =pretty-v2.1.140.js:114931-115130=.
+
+Fields written into the registry include:
+
+- =pid=
+- =sessionId=
+- =cwd=
+- =startedAt=
+- =procStart=
+- =version=
+- =peerProtocol=
+- =kind=: =interactive=, =bg=, =daemon=, or =daemon-worker=
+- =entrypoint=
+- optional =name=
+- optional =logPath=
+- optional =agent=
+- optional =jobId=
+
+Important behavioral details:
+
+- the directory is created with mode =0700=
+- pid files are removed on clean shutdown
+- the registry is also used to detect and clean up stale pid files
+- the current process updates the file when session ID, cwd, or metadata changes
+- the view also uses a =.fleetview-heartbeat= marker to detect whether the
+  full-screen agent view is currently open somewhere else
+
+This registry is what lets the system show and reason about sessions that are
+not owned by the current terminal.
+
+** Persisted Job State
+
+Job persistence is loaded via =l7()= and =fKH()= and seeded via =OKH()= in
+=pretty-v2.1.140.js:208720-209020=.
+
+Logical on-disk layout:
+
+#+begin_example
+<jobs-root>/
+  pins.json
+  <short-id>/
+    state.json
+    order
+    stateOrder
+#+end_example
+
+The exact root path is resolved by internal helpers (=HZ()=, =Z9()=) rather
+than being exposed as a public API, but the per-job structure is stable.
+
+Relevant persisted fields include:
+
+#+begin_src javascript
+{
+  state, detail, tempo, inFlight, needs, block, suggestedReply,
+  output, children, linkScanOffset, linkScanPath,
+  template, routine, respawnFlags, intent, initialPrompt,
+  name, nameSource, color,
+  sessionId, resumeSessionId, daemonShort, cliVersion,
+  cwd, createdAt, updatedAt, firstTerminalAt,
+  worktreePath, worktreeBranch, worktreeHookBased, originCwd,
+  bridgeSessionId, bridgeSessionSeq,
+  backend, sock, pid,
+  sortOrder, stateSortOrder, pinned
+}
+#+end_src
+
+The fields naturally split into a few roles:
+
+- *presentation*: =detail=, =name=, =color=, =suggestedReply=
+- *execution state*: =state=, =tempo=, =needs=, =inFlight=
+- *identity*: =sessionId=, =resumeSessionId=, =daemonShort=
+- *routing*: =backend=, =sock=, =pid=
+- *task semantics*: =template=, =routine=, =intent=, =initialPrompt=
+- *artifacts*: =output=, =children=
+- *workspace provenance*: =cwd=, =worktreePath=, =originCwd=
+- *list behavior*: =sortOrder=, =stateSortOrder=, =pinned=
+
+Pins are persisted globally via =pins.json= and older per-job =pinned= markers
+are migrated forward.
+
+** How New Jobs Are Spawned
+
+The release spawn path is =b3H()= and =J_5()= at
+=pretty-v2.1.119.js:572099-572290=.
+
+The dispatch flow is:
+
+1. Generate or accept a session UUID.
+2. Derive the short ID from the first 8 chars.
+3. Create the job directory.
+4. Seed =state.json= before the worker starts, so the UI has an optimistic row.
+5. Build a daemon dispatch payload.
+6. Send the payload to the daemon.
+7. If dispatch acknowledgement times out, query the daemon roster and accept
+   success if the worker is already live.
+
+The payload includes:
+
+- =short=
+- =sessionId=
+- =createdAt=
+- =source=
+- =cwd=
+- =launch=: either prompt args or resume session metadata
+- =respawnFlags=
+- =env=
+- =worktree=
+- =isolation=
+- =agent=
+- =routine=
+- =seed=
+- terminal =cols=/=rows=
+
+Two design choices are worth copying:
+
+- *optimistic seeding*: the list row appears before the runtime is fully ready
+- *ack-timeout tolerance*: the UI trusts the daemon roster over a single IPC
+  round-trip, which avoids false-negative launch failures
+
+** Reply, Attach, Stop, And Respawn
+
+The main control helpers in the release build are:
+
+- =u14()= at =pretty-v2.1.119.js:571216-571224= for the live daemon/worker set
+- =Ez8()= at =pretty-v2.1.119.js:571250-571281= for replies
+- =jN6()= at =pretty-v2.1.119.js:571282-571320= for attach/reconnect
+
+Reply semantics:
+
+- if =backend === "peer"=, the reply is sent over the peer socket
+- if there is no peer socket, the UI shows that the session is running in
+  another terminal and cannot be messaged from here
+- daemon-backed jobs update persisted state optimistically, then send a daemon
+  =reply= operation
+
+Attach semantics:
+
+- write an attach marker
+- attempt reconnect
+- if the daemon is restarting or the job is respawning, poll briefly and retry
+- if disconnected but still live, present a retryable error rather than
+  pretending the job is gone
+
+Stop/respawn semantics:
+
+- stop and delete share a two-step =ctrl+x= arm/confirm UX
+- exited jobs can be reopened via respawn, not only inspected
+- attach/open can therefore mean "reattach to live process" or "respawn then
+  attach", depending on state
+
+** Reconciliation Loop
+
+The view is continuously reconciled rather than rendered from a single source of
+truth.
+
+The main loop in =O34()=:
+
+- polls job/log/PR/loop data on a roughly 2s cadence
+- polls live busy/waiting status more frequently, around 500ms
+- merges persisted jobs with live-status overlays
+- keeps temporary optimistic rows for freshly dispatched jobs
+- re-applies focus after reorder, pin, and poll updates
+
+Additional reconciliation behavior from =pretty-v2.1.140.js:208910-209020=:
+
+- =fKH()= loads all persisted jobs and overlays pin state
+- =TxK()= adopts live daemon roster entries that do not yet have local state
+- stale non-live jobs can be normalized into terminal or failed states
+
+This is a critical architectural lesson. The agent view is a *reconciler*, not
+just a renderer over one store.
+
+** Activity And Grouping Semantics
+
+Derived activity comes from =dY8()= at =pretty-v2.1.119.js:593817-593838=.
+
+- terminal states map directly to =success=, =failure=, or =stopped=
+- PR-review jobs can become =success= when all child PRs are merged
+- otherwise active/stale timing maps to =flowing=, =slowing=, or =stuck=
+
+The heuristic uses recent =updatedAt= timestamps:
+
+- active tempo gets tighter thresholds
+- idle-ish tempo gets looser thresholds
+- roughly <3 minutes => =flowing=
+- roughly <15 minutes => =slowing=
+- beyond that => =stuck=
+
+Grouping comes from =oY4()= at =pretty-v2.1.119.js:593839-593856=:
+
+- live =busy= status forces =working=
+- open child PRs needing review force =review=
+- blocked tempo, failure, or waiting force =blocked=
+- success/stopped force =done=
+- otherwise the job is =working=
+
+This makes the state view intentionally opinionated. It is grouping by *what the
+user should think about next*, not by raw runtime status.
+
+** Suggestions And Fast Dispatch
+
+The list UI also acts as a launcher:
+
+- suggestions are generated from agents, repos, routines, and skills
+- =Tab= opens or applies suggestions
+- the input parser can choose template, cwd, and routine from one line
+- a prewarmed spare background session can satisfy fast plain-text dispatches
+
+That spare-session optimization is one reason the implementation distinguishes
+between the user-visible "new agent" action and the transport-level worker that
+actually runs the job.
+
+* Modeling Notes For Pi Or A Custom Harness
+
+If you wanted to port this concept into Pi or another harness, the durable
+concepts to copy are:
+
+- Model *jobs* separately from *agent definitions*.
+- Give each job both a stable UUID session ID and a short human handle.
+- Persist enough row state that the list can render before the runtime is ready.
+- Track transport/backend explicitly. "Running in another terminal" is a real
+  state, not an error.
+- Make reply, attach, stop, and respawn first-class operations on the job.
+- Keep a process/session registry separate from the job store.
+- Reconcile multiple sources repeatedly instead of treating disk or daemon as
+  absolute truth.
+- Group by user-facing workflow states, not only machine states.
+- Preserve optimistic UI updates, but reconcile them against the live roster.
+- Treat worktree/isolation metadata as part of the job model, not a sidecar.
+
+If the target harness does not have a local daemon, the minimum compatible
+replacement is still:
+
+1. a persistent job store
+2. a live session registry
+3. a bidirectional reply channel
+4. a durable attach/open path
+
+Without those, the result will look like an agent view but behave like a static
+task list.
+
+* Performance And Operational Notes
+
+The current implementation makes several practical tradeoffs:
+
+- job-state reads are cached by mtime and the cache is bounded
+- reorder writes are debounced instead of flushing on every keypress
+- the list view tolerates daemon ack timeouts if roster evidence says the job is
+  really live
+- pin state is global rather than stored only in each job dir
+- pid-file cleanup is opportunistic and removes stale entries from dead peers
+
+These details matter because the feature is designed for long-lived, messy local
+state rather than a clean request/response server.
+
+* Security Implications
+
+- Administrators can disable the entire surface with managed settings or
+  =CLAUDE_CODE_DISABLE_AGENT_VIEW=.
+- The session registry exposes cwd, session IDs, and local job relationships, so
+  it is protected with user-only directory permissions.
+- Worktree ownership is carried in the dispatch payload, which helps keep
+  isolated worktree jobs associated with their owning session.
+- Peer sessions may be visible but not controllable if there is no live socket.
+  Visibility and controllability are intentionally separate.
+
+* Source Map
+
+- Feature introduction:
+  =archive/claude-code/changelog/changelog-v2.1.119.md=
+- Default-open setting:
+  =archive/claude-code/changelog/changelog-v2.1.133.md=
+- Rename to "agent view":
+  =archive/claude-code/changelog/changelog-v2.1.139.md=
+- Gate and config surfaces:
+  =archive/claude-code/pretty/pretty-v2.1.140.js:58107-58111=
+  =archive/claude-code/pretty/pretty-v2.1.140.js:163307-163344=
+  =archive/claude-code/pretty/pretty-v2.1.140.js:504528-505057=
+  =archive/claude-code/pretty/pretty-v2.1.140.js:713472-713510=
+- Concurrent session registry and heartbeat:
+  =archive/claude-code/pretty/pretty-v2.1.140.js:114931-115130=
+- Persisted job state, pins, adoption:
+  =archive/claude-code/pretty/pretty-v2.1.140.js:208720-209020=
+- Release UI, dispatch, and control loop:
+  =archive/claude-code/pretty/pretty-v2.1.119.js:571216-572290=
+  =archive/claude-code/pretty/pretty-v2.1.119.js:593817-593939=
+  =archive/claude-code/pretty/pretty-v2.1.119.js:594394-597040=

@@ -1,0 +1,249 @@
+#+TITLE: Remote Control And Cloud Agents
+#+DATE: 2026-06-25
+
+* Overview
+
+This document covers the "remote" side of Claude Code: the mechanisms by which a
+session can be *driven from claude.ai or the mobile app*, and by which agents can
+run *in Anthropic's cloud* rather than on the local machine. The user-facing
+question that prompted this investigation — "is the agent view connected to a
+remote control server?" — turns out to have a layered answer, because there are
+*two distinct systems* that are easy to conflate:
+
+1. *Remote Control of a local session* (=/remote-control=, =--rc=). The local
+   =claude= process stays running on your machine, opens a persistent outbound
+   connection to Anthropic, and lets a remote viewer (claude.ai / mobile) watch
+   the session and send control commands into it (permissions, model switches,
+   replies, interrupts). The compute is *local*; the *control* is remote.
+2. *Cloud agents (CCR — Cloud/Code Remote)*. A whole Claude Code session runs in
+   Anthropic's infrastructure, not on your machine. Reached via the Agent tool's
+   =isolation: "remote"=, the =RemoteTrigger= tool, and cloud routines created
+   by =/schedule=. The compute is *remote*; your machine may not be involved at
+   all once it is launched.
+
+Both are gated behind GrowthBook flags and claude.ai login, and most of the code
+is present-but-dark in current builds. The two systems are *mutually exclusive
+within one process*: =WDe()= (=512061=) returns "fleet enabled" only when *not*
+already inside a remote session (=WI() && !sa()=).
+
+All line numbers are from =archive/claude-code/pretty/pretty-v2.1.191.js= unless
+noted.
+
+* System 1: Remote Control Of A Local Session
+
+This is the closest thing to a "remote control server." It is *not* a websocket
+control daemon you run; it is an *outbound SSE bridge* from your local process to
+=api.anthropic.com=, over which a remote viewer drives the session.
+
+** Establishing the bridge
+
+1. *Session record.* =bridge_session_create= (=538720+=) POSTs to
+   =https://api.anthropic.com/v1/sessions= with =source: "remote-control"=
+   (=538761=), creating a cloud session record that the web/mobile client can
+   open.
+2. *Inbound stream (SSE).* =SessionsV2Client= (class =K$o=, =652966=) opens a
+   persistent HTTP GET to
+   =/v1/code/sessions/{id}/events/stream= with
+   =Accept: text/event-stream= (=653001=, base path confirmed at =170243=,
+   =170299=). It reconnects with exponential backoff (=653256=) and tracks
+   liveness (=653272=). This is *SSE, not a websocket*.
+3. *Outbound posts.* =sendEvent()= (=653300=) POSTs local session events to
+   =/v1/code/sessions/{id}/events= (=170337=, =653307=). So the process both
+   subscribes (GET stream) and publishes (POST) over plain HTTPS.
+
+The token for this bridge is the =session_ingress_token= (=113572=,
+=356037=); the same token is reused for the CCR worker connection (System 2).
+
+** The control protocol
+
+Inbound frames of type =control_request= (=653526=) carry subtypes that drive
+the local UI. Observed subtypes:
+
+- =can_use_tool= — a remote permission prompt; the remote viewer approves/denies
+  a tool call.
+- =request_user_dialog= — surface a dialog to the remote viewer.
+- =set_model=, =interrupt=, =side_question=.
+
+The local session answers via =sendControlResponse()= (=653362=), posting the
+result back over HTTPS. The wrapper =RemoteSessionManager= (=X$o=, =653477=)
+marshals these frames into the *same* permission/dialog flow the local TUI uses —
+so a remote approval and a local keypress hit identical code.
+
+The reverse direction also exists: =X$o.sendControlRequest()= (=653752=) lets the
+*local* session push requests *to the remote viewer* — e.g. =side_question=,
+=file_suggestions=, =get_context_usage=, =reload_plugins=, =set_model=
+(=561201=, =564069=, =576642=, =638936=, =647970=).
+
+** Mental model
+
+Think of it as a screen-share-plus-remote-input for one CLI session, mediated by
+an Anthropic relay:
+
+#+begin_example
+  local claude process  <--- SSE stream (control_request) ---  api.anthropic.com  <-->  claude.ai / mobile
+        |  (POST events / responses) --------------------------->        ^
+        |  runs all tools locally, on your filesystem                    |
+        +--- remote viewer sees output, sends permissions/replies -------+
+#+end_example
+
+The compute, filesystem, and tools are entirely local. The relay only carries
+events one way and control frames the other.
+
+* System 2: Cloud Agents (CCR)
+
+Here the agent itself runs in Anthropic's cloud. The local machine is the
+*launcher*, not the host.
+
+** isolation: "remote" on the Agent tool
+
+=w5()= (=431914=) POSTs to =https://api.anthropic.com/v1/sessions= (=431955=)
+with a =session_context= containing the git repo as =source=, an optional code
+bundle, and the initial prompt. It returns a session id tracked locally as a
+background task and a =sessionUrl=; the agent runs remotely
+(=status: "remote_launched"=). There is also a =/v2/ccr-sessions/= path
+(=170836=) and a BYOC ("bring your own cloud") variant keyed by the beta header
+=ccr-byoc-2025-07-29= (=431958=, =538767=).
+
+Eligibility =vVt()= (=498831=) requires *all* of:
+
+- claude.ai OAuth login (=jl()=)
+- =CLAUDE_CODE_REMOTE= unset (prevents nesting cloud-in-cloud)
+- =hasUsedRemoteSession && hasRemoteEnvironment=
+- GrowthBook flag =tengu_neapolitan= (=498836=)
+
+When the flag is off, =isolation: "remote"= silently falls back to =worktree= or
+local (=499577=); one SDK path instead throws "agent({isolation:'remote'}) is
+not available in this build" (=491093-491096=).
+
+** The cloud worker connects back
+
+Once a CCR session exists, the *remote* Claude process registers as a worker by
+opening =wss://<api-base>/v1/session_ingress/ws/<sessionId>= (=663684=,
+built by =VVl()= at =663679=) and =POST /worker/register= (=663697=), then
+streams events via =CCRClient= (=722956+=). Note this websocket is *cloud-to-cloud*
+(the remote worker talking to the ingress), not something your local machine
+holds open. The local machine's only durable connection in this story is the
+System-1 SSE stream, if Remote Control is enabled to watch the cloud session.
+
+Inside a CCR session the environment sets =CLAUDE_CODE_REMOTE=,
+=CLAUDE_CODE_REMOTE_SESSION_ID= (=169266+=), and =CCR_SPAWN_TIMESTAMP_MS=
+(=13019=).
+
+** RemoteTrigger: cloud routines
+
+=RemoteTrigger= (var =Iqe=, =508834=) is an in-session tool that manages
+*scheduled routines hosted on claude.ai*. Its =call()= hits the teleport-org
+authenticated client against (=508999-509016=):
+
+#+begin_example
+GET  /v1/code/triggers           list
+GET  /v1/code/triggers/{id}       get
+POST /v1/code/triggers            create
+POST /v1/code/triggers/{id}       update
+POST /v1/code/triggers/{id}/run   run now
+#+end_example
+
+On create it returns a viewer URL =https://claude.ai/code/routines/{id}=
+(=508905=) and tells the user results appear there. It is enabled only when
+logged in with the first-party provider, =CLAUDE_CODE_REMOTE= unset, the
+=tengu_surreal_dali= flag is on, and policy allows remote sessions
+(=508969-508975=). The permission text is explicit: "RemoteTrigger registers
+agents with cloud services (claude.ai/code/routines)" (=444196=).
+
+*What happens when a trigger fires is not in this binary.* The =run= call just
+POSTs to the cloud API; Anthropic's infrastructure then spawns a fresh Claude
+Code process *in the cloud* with =CLAUDE_CODE_ENTRYPOINT=remote_trigger=
+(=50718=). The =<routine_summary>= block in those sessions' system prompt becomes
+the phone banner / email body (=265572=, =265589=). The execution engine itself
+is server-side.
+
+** Two scheduling paths, do not confuse them
+
+| Path           | Where it lives             | Where it runs    | Where results show |
+|----------------+----------------------------+------------------+--------------------|
+| =CronCreate=   | =.claude/scheduled_tasks.json= (=265467=) | local daemon / session | =os_notification= in terminal |
+| =RemoteTrigger=/=/schedule= | =POST /v1/code/triggers= (claude.ai) | cloud CCR | claude.ai/code/routines |
+
+The =/schedule= skill (gated by =tengu_surreal_dali=) drives the *cloud* path —
+"scheduling" there means registering a server-side cron entry, not arming a local
+timer. =CronCreate= is the purely local analog.
+
+* Push Notifications
+
+=PushNotification= (tool =Xq=, =509333-509500=) does two things:
+
+1. Fires an =os_notification= event (=509476=) routed to the local terminal
+   emulator (iTerm2, Kitty, etc., =813941=).
+2. If the session is remote (=sa()=) *or* the REPL bridge is active (=dk()=,
+   =3804=), it also returns =pushSent: true= (=509496=), meaning the notification
+   was mirrored through the Remote Control channel for claude.ai / mobile to
+   surface.
+
+Notably there is *no separate device-token registration* — no APNS/FCM token, no
+Expo client — in this build. Mobile push is delivered entirely through the
+System-1 bridge: the event is written to the shared session, and the already-
+connected web/mobile client picks it up. Gated by the =agentPushNotifEnabled=
+setting (=65534=) and =tengu_kairos_push_notifications= (=265560=), with a
+variant =tengu_kairos_input_needed_push= (=265564=) that fires specifically when
+Claude is waiting for input.
+
+* Relationship To The Agent Daemon
+
+The remote-control bridge and the local fleet daemon
+([[file:agent-daemon.org][agent-daemon.org]]) *share the same daemon dispatch layer* through a
+user preference =autoAddRemoteControlDaemonWorker= (=573963=). When enabled, the
+daemon automatically keeps a remote-control-capable worker running so that
+background jobs can be watched/driven remotely without an attached terminal.
+
+The connecting call is =enableRemoteControl()= (=658611=), which sends a
+=\{ subtype: "remote_control", enabled: true \}= control request over the
+daemon's RPC channel (=remote_control_rpc=, =653754=). The handling worker
+registers the local session into the Remote Control bridge. So enabling remote
+control on a background job is *the same code path* as ordinary daemon dispatch,
+not a parallel system.
+
+But note the exclusivity from the overview: a process that is *itself* a remote
+(CCR) session has the local fleet disabled (=WDe()= → =WI() && !sa()=,
+=512061=). Cloud agents do not themselves show a local agent view.
+
+* Distinguishing The Two Systems (Summary)
+
+| Property            | Remote Control (System 1)        | Cloud Agents / CCR (System 2)         |
+|---------------------+----------------------------------+---------------------------------------|
+| Where compute runs  | local machine                    | Anthropic cloud                       |
+| Triggered by        | =/remote-control=, =--rc=        | =isolation:"remote"=, =RemoteTrigger=, =/schedule= |
+| Local connection    | outbound SSE to =/v1/code/sessions/{id}/events/stream= | launch POST then mostly hands off |
+| Remote's role       | viewer/driver (permissions, replies) | runs the whole agent              |
+| Filesystem          | your local files                 | a cloud checkout of the repo          |
+| Gate flag           | (login + policy)                 | =tengu_neapolitan= / =tengu_surreal_dali= |
+| Survives logout?    | only if local process survives   | yes — runs server-side                |
+
+* Caveats And Unknowns
+
+- =tengu_neapolitan= (CCR) and =tengu_surreal_dali= (RemoteTrigger / schedule)
+  default *false*. Much of the cloud path is present in the binary but inert in a
+  default build.
+- The *server-side* execution engine for cloud routines and CCR sessions is not
+  in this binary — only the client registration/management surface is. Claims
+  about "what runs in the cloud" are inferred from the API contract and the
+  =remote_trigger= entrypoint, not from observed server code.
+- =wss://bridge.claudeusercontent.com= (=706062-706063=) is the *Chrome
+  extension* bridge, unrelated to Remote Control. Remote Control uses HTTPS/SSE
+  to =api.anthropic.com=; the only websocket in the CCR path is the
+  cloud-side worker ingress (=663684=).
+- =/v1/sessions/{id}/events/stream?beta=true= (=8336=) is the *SDK's* Sessions
+  API face of the same backend, distinct from the CLI's =/v1/code/sessions=
+  surface.
+
+* Source Map
+
+- Remote Control bridge: =pretty-v2.1.191.js:538720-538767=, =652966-653010=, =653256-653526=
+- Control protocol responses: =pretty-v2.1.191.js:653362=, =653477=, =653752=
+- CCR launch (=isolation:"remote"=): =pretty-v2.1.191.js:431914-431958=, =498831-498836=, =499576-499663=
+- CCR worker ingress (=wss://=): =pretty-v2.1.191.js:663671-663697=
+- RemoteTrigger tool: =pretty-v2.1.191.js:508834-509069=, =444196=
+- =remote_trigger= entrypoint: =pretty-v2.1.191.js:50718=
+- PushNotification: =pretty-v2.1.191.js:509333-509500=, =265560-265564=
+- Daemon ↔ remote-control link: =pretty-v2.1.191.js:573963=, =658611=, =653754=
+- Cron (local) vs triggers (cloud): =pretty-v2.1.191.js:265467=, =266544=, =508999-509016=
+- Related: [[file:agent-daemon.org][agent-daemon.org]], [[file:agent-view.org][agent-view.org]]

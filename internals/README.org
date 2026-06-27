@@ -11,6 +11,10 @@ This directory contains detailed technical investigations of Claude Code's inter
 - [[file:websocket-protocol.org][WebSocket Protocol]] - Internal WebSocket communication protocol and message handling
 - [[file:session-log-format.org][Session Log Format]] - Conversation logging format and session data structure
 - [[file:telemetry.org][Telemetry]] - Analytics, metrics collection, and privacy controls
+- [[file:agent-view.org][Agent View]] - Fleet/agent-view TUI, background-session control plane, and job/session model
+- [[file:agent-daemon.org][Agent Daemon Runtime]] - The supervisor+PTY-host daemon that runs background agents: spawn/detach, terminal-survival, workers, attach transport, lifecycle, cwd resolution, and the tool-vs-daemon initiation boundary
+- [[file:remote-control.org][Remote Control And Cloud Agents]] - Driving a local session from claude.ai/mobile (SSE bridge) vs running agents in Anthropic's cloud (CCR, RemoteTrigger, cloud routines), and push notifications
+- [[file:dynamic-workflows.org][Dynamic Workflows]] - The =Workflow= tool: VM-sandboxed orchestration scripts, subagent dispatch, journaling/resume, and progress UI
 
 ** Performance & Optimization
 
