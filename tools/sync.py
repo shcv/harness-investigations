@@ -1614,6 +1614,19 @@ class ClaudeCodeSync:
                 check=False,
             )
             if push.returncode != 0:
+                # The default push likely goes over SSH with a
+                # Yubikey-touch-gated key, which nothing can satisfy from an
+                # unattended run. Retry over HTTPS using gh's stored token
+                # (already configured as git's credential helper for
+                # github.com) instead of weakening the SSH/signing setup.
+                fallback = self._push_via_gh_https()
+                if fallback is not None:
+                    print_warning(
+                        f"git push (ssh) failed for {rel_path}, retrying via gh over HTTPS"
+                    )
+                    push = fallback
+
+            if push.returncode != 0:
                 print_warning(f"git push failed after committing {rel_path}: {push.stderr.strip()}")
                 self._notify_failure(
                     "changelog auto-push failed",
@@ -1630,6 +1643,41 @@ class ClaudeCodeSync:
             print_warning(f"git commit/push failed for {rel_path}: {e}")
             self.stats.changelog_commit_failures += 1
             return False
+
+    def _push_via_gh_https(self):
+        """Retry the current branch's push over HTTPS using gh's stored
+        OAuth token instead of the SSH remote. Returns the CompletedProcess,
+        or None if there's no github.com upstream to translate (e.g. a
+        non-GitHub remote), in which case the caller keeps the original
+        SSH failure.
+        """
+        upstream = run(
+            ["git", "-C", str(self.base_dir), "rev-parse",
+             "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        remote_name, sep, branch = upstream.partition("/")
+        if not sep:
+            return None
+
+        remote_url = run(
+            ["git", "-C", str(self.base_dir), "remote", "get-url", remote_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        https_url = re.sub(r"^git@github\.com:", "https://github.com/", remote_url)
+        if https_url == remote_url and not remote_url.startswith("https://github.com"):
+            return None  # not a github.com remote; gh's helper won't apply
+
+        return run(
+            ["git", "-C", str(self.base_dir), "push", https_url, f"HEAD:{branch}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     def _get_cleanup_module(self):
         """Load and cache the cleanup_changelogs module."""
