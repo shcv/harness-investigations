@@ -1653,6 +1653,14 @@ class ClaudeCodeSync:
         else:
             primary_diff_kind = "unknown"
 
+        # Report the concrete model that actually served the request, not
+        # just the (possibly alias) string we requested — e.g. "sonnet" may
+        # resolve to a different snapshot over time.
+        resolved_model = (
+            getattr(self._changelog_agent, "last_resolved_model", None)
+            or self.changelog_model
+        )
+
         lines = [
             "",
             "---",
@@ -1660,7 +1668,7 @@ class ClaudeCodeSync:
             "Generated with:",
             f"- tool: `harness-investigations@{self._get_tool_version()}`",
             f"- provider: `{self.agent_provider}`",
-            f"- model: `{self.changelog_model}`",
+            f"- model: `{resolved_model}`",
         ]
 
         if self.agent_provider == "codex" and self.codex_reasoning_effort:
@@ -3595,7 +3603,7 @@ Examples:
         or os.getenv("CHANGELOG_CHANGELOG_MODEL"),
         help=(
             "Model for final changelog generation. Defaults by provider "
-            "(claude: claude-sonnet-4-6, codex: gpt-5.4)."
+            "(claude: sonnet, codex: gpt-5.4)."
         ),
     )
 

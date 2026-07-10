@@ -39,6 +39,10 @@ class AgentRunRequest:
 class BaseAgentRunner:
     provider = "base"
     supports_file_write_tool = False
+    # The concrete model ID that actually served the last run(), if the
+    # provider can report one (e.g. resolving a "sonnet"-style alias).
+    # None means: no better information than the requested model string.
+    last_resolved_model: Optional[str] = None
 
     def check_available(self) -> None:
         raise NotImplementedError
@@ -53,6 +57,7 @@ class ClaudeSdkRunner(BaseAgentRunner):
 
     def __init__(self, model: Optional[str] = None):
         self.model = model
+        self.last_resolved_model = None
 
     def check_available(self) -> None:
         try:
@@ -63,7 +68,12 @@ class ClaudeSdkRunner(BaseAgentRunner):
             ) from exc
 
     def run(self, request: AgentRunRequest) -> str:
-        from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ClaudeAgentOptions,
+            ResultMessage,
+            query,
+        )
 
         # Use the caller's default CLAUDE_CONFIG_DIR (normally ~/.claude). We do
         # NOT isolate the config dir: a separate dir needs its own credentials,
@@ -90,6 +100,11 @@ class ClaudeSdkRunner(BaseAgentRunner):
         async def _execute() -> str:
             result = ""
             async for msg in query(prompt=request.prompt, options=options):
+                if isinstance(msg, AssistantMessage) and msg.model:
+                    # Track the last-seen resolved model in case an alias
+                    # (e.g. "sonnet") or a fallback_model switch changed which
+                    # concrete model actually served the request.
+                    self.last_resolved_model = msg.model
                 if isinstance(msg, ResultMessage):
                     if msg.is_error:
                         raise AgentRunnerError(msg.result or "Claude query failed")
@@ -242,7 +257,7 @@ def default_model_for(provider: str, role: str) -> str:
         return (
             "claude-haiku-4-5-20251001"
             if role == "annotation"
-            else "claude-sonnet-4-6"
+            else "sonnet"
         )
     if provider == "codex":
         return "gpt-5.4-mini" if role == "annotation" else "gpt-5.4"
