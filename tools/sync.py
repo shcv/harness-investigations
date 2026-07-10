@@ -169,6 +169,8 @@ class SyncStats:
     changelog_cleanup_failures: int = 0
     changelogs_posted_count: int = 0
     changelog_post_failures: int = 0
+    changelogs_committed_count: int = 0
+    changelog_commit_failures: int = 0
 
 
 class ClaudeCodeSync:
@@ -197,6 +199,7 @@ class ClaudeCodeSync:
         changes: bool = False,
         cleanup: bool = False,
         post: bool = False,
+        git_commit: bool = False,
         latest: bool = False,
         since: Optional[str] = None,
         new_first: bool = False,
@@ -219,6 +222,7 @@ class ClaudeCodeSync:
         self.changes = changes
         self.do_cleanup = cleanup
         self.post = post
+        self.git_commit = git_commit
         self.latest = latest
         # Fall back to the project's min_version floor if no explicit --since.
         # An explicit --since (even one older than the floor) wins, so ad-hoc
@@ -1550,6 +1554,83 @@ class ClaudeCodeSync:
             self.stats.changelog_post_failures += 1
             return False
 
+    def git_commit_changelog(self, changelog_file: Path, version_str: str) -> bool:
+        """Commit and push a single changelog file, touching nothing else.
+
+        Uses a pathspec-scoped `git commit -- <path>` so unrelated dirty
+        state elsewhere in the working tree (in-progress edits, scratch
+        dirs) is never swept in. Returns True on success.
+        """
+        rel_path = self._relative_display_path(changelog_file)
+        try:
+            status = run(
+                ["git", "-C", str(self.base_dir), "status", "--porcelain", "--", rel_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if not status.stdout.strip():
+                print_info(f"No git changes for {rel_path}, skipping commit")
+                return False
+
+            if self.dry_run:
+                print_info(f"[dry-run] Would commit and push {rel_path}")
+                return True
+
+            add = run(
+                ["git", "-C", str(self.base_dir), "add", "--", rel_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if add.returncode != 0:
+                print_warning(f"git add failed for {rel_path}: {add.stderr.strip()}")
+                self.stats.changelog_commit_failures += 1
+                return False
+
+            resolved_model = (
+                getattr(self._changelog_agent, "last_resolved_model", None)
+                or self.changelog_model
+            )
+            commit_message = (
+                f"archive: add {self.project.name} changelog for v{version_str}\n\n"
+                f"Assisted-by: Claude {resolved_model}\n"
+            )
+            commit = run(
+                ["git", "-C", str(self.base_dir), "commit", "-m", commit_message, "--", rel_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if commit.returncode != 0:
+                print_warning(f"git commit failed for {rel_path}: {commit.stderr.strip()}")
+                self.stats.changelog_commit_failures += 1
+                return False
+
+            push = run(
+                ["git", "-C", str(self.base_dir), "push"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if push.returncode != 0:
+                print_warning(f"git push failed after committing {rel_path}: {push.stderr.strip()}")
+                self._notify_failure(
+                    "changelog auto-push failed",
+                    f"v{version_str}: {push.stderr.strip()[:300]}",
+                )
+                self.stats.changelog_commit_failures += 1
+                return False
+
+            self.stats.changelogs_committed_count += 1
+            print_success(f"Committed and pushed {rel_path}")
+            return True
+
+        except Exception as e:
+            print_warning(f"git commit/push failed for {rel_path}: {e}")
+            self.stats.changelog_commit_failures += 1
+            return False
+
     def _get_cleanup_module(self):
         """Load and cache the cleanup_changelogs module."""
         if self._cleanup_module is not None:
@@ -2464,6 +2545,11 @@ per-feature explanations.
             if self.do_cleanup:
                 self.cleanup_single_changelog(changelog_file, version_str)
 
+            # Immediately commit and push (just this file) if enabled. Runs
+            # after cleanup so the committed content is the final version.
+            if self.git_commit:
+                self.git_commit_changelog(changelog_file, version_str)
+
             # Immediately post if posting is enabled
             if self.post:
                 self.post_single_changelog(changelog_file, version_str)
@@ -3172,6 +3258,12 @@ Package: `{self.project.npm_package}`
                     f"Posted {self.stats.changelogs_posted_count} changelog(s) to Discord"
                 )
 
+        if self.git_commit:
+            if self.stats.changelogs_committed_count > 0:
+                print_success(
+                    f"Committed and pushed {self.stats.changelogs_committed_count} changelog(s)"
+                )
+
         # Print any failures
         total_failures = (
             self.stats.download_failures
@@ -3181,6 +3273,7 @@ Package: `{self.project.npm_package}`
             + self.stats.changes_generation_failures
             + self.stats.changelog_cleanup_failures
             + self.stats.changelog_post_failures
+            + self.stats.changelog_commit_failures
         )
         if total_failures > 0:
             print_warning(f"Total failures: {total_failures}")
@@ -3534,6 +3627,12 @@ Examples:
     )
 
     parser.add_argument(
+        "--git-commit",
+        action="store_true",
+        help="Commit and push each generated changelog file individually after cleanup",
+    )
+
+    parser.add_argument(
         "--all",
         action="store_true",
         help="Run all processing steps (prettier, diff, filter, changelog, cleanup, post)",
@@ -3683,6 +3782,7 @@ Examples:
         changes=args.changes,
         cleanup=args.cleanup,
         post=args.post,
+        git_commit=args.git_commit,
         latest=args.latest,
         since=args.since,
         new_first=args.new_first,
