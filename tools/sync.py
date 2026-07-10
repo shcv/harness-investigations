@@ -56,6 +56,14 @@ except ImportError:
     # python-dotenv not installed, skip loading .env file
     pass
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean CHANGELOG_* env var, defaulting when unset."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
 class ProjectConfig:
     """Configuration for a specific project/package"""
 
@@ -200,6 +208,8 @@ class ClaudeCodeSync:
         cleanup: bool = False,
         post: bool = False,
         git_commit: bool = False,
+        git_remote: Optional[str] = None,
+        git_https_fallback: bool = False,
         latest: bool = False,
         since: Optional[str] = None,
         new_first: bool = False,
@@ -223,6 +233,8 @@ class ClaudeCodeSync:
         self.do_cleanup = cleanup
         self.post = post
         self.git_commit = git_commit
+        self.git_remote = git_remote
+        self.git_https_fallback = git_https_fallback
         self.latest = latest
         # Fall back to the project's min_version floor if no explicit --since.
         # An explicit --since (even one older than the floor) wins, so ad-hoc
@@ -1607,18 +1619,18 @@ class ClaudeCodeSync:
                 self.stats.changelog_commit_failures += 1
                 return False
 
-            push = run(
-                ["git", "-C", str(self.base_dir), "push"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if push.returncode != 0:
+            push_cmd = ["git", "-C", str(self.base_dir), "push"]
+            if self.git_remote:
+                push_cmd.append(self.git_remote)
+            push = run(push_cmd, capture_output=True, text=True, check=False)
+            if push.returncode != 0 and self.git_https_fallback:
                 # The default push likely goes over SSH with a
                 # Yubikey-touch-gated key, which nothing can satisfy from an
                 # unattended run. Retry over HTTPS using gh's stored token
                 # (already configured as git's credential helper for
                 # github.com) instead of weakening the SSH/signing setup.
+                # Opt-in via --git-https-fallback / CHANGELOG_GIT_HTTPS_FALLBACK
+                # since it depends on gh being installed and authenticated.
                 fallback = self._push_via_gh_https()
                 if fallback is not None:
                     print_warning(
@@ -1651,16 +1663,27 @@ class ClaudeCodeSync:
         non-GitHub remote), in which case the caller keeps the original
         SSH failure.
         """
-        upstream = run(
-            ["git", "-C", str(self.base_dir), "rev-parse",
-             "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        branch = run(
+            ["git", "-C", str(self.base_dir), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
             check=False,
         ).stdout.strip()
-        remote_name, sep, branch = upstream.partition("/")
-        if not sep:
-            return None
+
+        if self.git_remote:
+            remote_name = self.git_remote
+        else:
+            upstream = run(
+                ["git", "-C", str(self.base_dir), "rev-parse",
+                 "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            remote_name, sep, upstream_branch = upstream.partition("/")
+            if not sep:
+                return None
+            branch = upstream_branch or branch
 
         remote_url = run(
             ["git", "-C", str(self.base_dir), "remote", "get-url", remote_name],
@@ -3681,6 +3704,30 @@ Examples:
     )
 
     parser.add_argument(
+        "--git-remote",
+        default=os.getenv("CHANGELOG_GIT_REMOTE"),
+        help=(
+            "Git remote to push generated changelogs to (used with --git-commit). "
+            "Defaults to the current branch's tracked upstream if unset. "
+            "Can also be set with CHANGELOG_GIT_REMOTE — keep this out of "
+            "version control if it names a private remote."
+        ),
+    )
+
+    parser.add_argument(
+        "--git-https-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("CHANGELOG_GIT_HTTPS_FALLBACK", False),
+        help=(
+            "If the --git-commit push fails (e.g. an SSH key gated behind a "
+            "hardware-key touch that an unattended run can't provide), retry "
+            "over HTTPS using `gh`'s stored credentials. Off by default since "
+            "it requires gh installed and authenticated for the target host. "
+            "Can also be set with CHANGELOG_GIT_HTTPS_FALLBACK=true."
+        ),
+    )
+
+    parser.add_argument(
         "--all",
         action="store_true",
         help="Run all processing steps (prettier, diff, filter, changelog, cleanup, post)",
@@ -3831,6 +3878,8 @@ Examples:
         cleanup=args.cleanup,
         post=args.post,
         git_commit=args.git_commit,
+        git_remote=args.git_remote,
+        git_https_fallback=args.git_https_fallback,
         latest=args.latest,
         since=args.since,
         new_first=args.new_first,
