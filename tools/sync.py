@@ -3340,7 +3340,13 @@ Package: `{self.project.npm_package}`
                 )
 
         # Print any failures
-        total_failures = (
+        total_failures = self.failure_count()
+        if total_failures > 0:
+            print_warning(f"Total failures: {total_failures}")
+
+    def failure_count(self) -> int:
+        """Return the number of failed operations across all pipeline phases."""
+        return (
             self.stats.download_failures
             + self.stats.prettier_failures
             + self.stats.diff_generation_failures
@@ -3350,8 +3356,6 @@ Package: `{self.project.npm_package}`
             + self.stats.changelog_post_failures
             + self.stats.changelog_commit_failures
         )
-        if total_failures > 0:
-            print_warning(f"Total failures: {total_failures}")
 
     def run(self):
         """Execute the sync process"""
@@ -3396,6 +3400,13 @@ Package: `{self.project.npm_package}`
 
             # Summary
             self.print_summary()
+            failures = self.failure_count()
+            if failures:
+                self._notify_failure(
+                    "sync completed with failures",
+                    f"{failures} operation(s) failed; see ai-cli-changelog-sync.log",
+                )
+            return failures
 
         except KeyboardInterrupt:
             print_warning("\nSync interrupted by user")
@@ -3911,7 +3922,7 @@ Examples:
         sync_tool.check_dependencies()
         sync_tool.redo_versions()
     else:
-        sync_tool.run()
+        sys.exit(sync_tool.run())
 
 
 if __name__ == "__main__":
