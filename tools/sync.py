@@ -1604,9 +1604,13 @@ class ClaudeCodeSync:
                 getattr(self._changelog_agent, "last_resolved_model", None)
                 or self.changelog_model
             )
+            agent_name = {
+                "claude": "Claude",
+                "codex": "Codex",
+            }[self.agent_provider]
             commit_message = (
                 f"archive: add {self.project.name} changelog for v{version_str}\n\n"
-                f"Assisted-by: Claude {resolved_model}\n"
+                f"Assisted-by: {agent_name} {resolved_model}\n"
             )
             commit = run(
                 ["git", "-C", str(self.base_dir), "commit", "-m", commit_message, "--", rel_path],

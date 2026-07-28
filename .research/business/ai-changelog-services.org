@@ -1,0 +1,120 @@
+#+TITLE: AI Changelog Services and Expansion Options
+#+DATE: 2026-05-28
+#+STATUS: active
+
+* Problem Statement
+
+Assess the current harness-investigations changelog system, compare it with
+similar online AI changelog and release-note services, and identify practical
+expansion and monetization paths.
+
+* Current System
+
+The local system is a script-driven pipeline centered on =tools/sync.py=.
+It currently tracks Claude Code, Claude Agent SDK, and Codex releases. It
+downloads or syncs release artifacts, generates diffs, filters noisy changes,
+asks an agent to write a user-facing changelog, stamps deterministic generation
+metadata, and optionally posts to Discord.
+
+Key current strengths:
+- Deep artifact analysis, not just commits or PR titles.
+- Semantic JS astdiff and string-literal diffs for minified npm bundles.
+- Raw source-tree diffs for GitHub-backed projects such as Codex.
+- Official GitHub release notes are used as a baseline when available.
+- Generated artifacts include provider/model/diff provenance.
+- Discord fan-out already supports multiple configured servers and channels.
+- A host-local mcron wrapper runs the sync every five minutes on termini.
+
+Key current gaps:
+- No public hosted archive or canonical web page.
+- No RSS, Atom, JSON Feed, email, webhook, Slack, mobile push, or ntfy channel.
+- No user accounts, subscription state, project request queue, or entitlement model.
+- No per-user/topic filters, keyword watches, severity scoring, or digests.
+- No self-service project onboarding, source/binary upload workflow, or billing.
+- No review/edit UI for generated notes before publication.
+
+* Market Scan
+
+Broad categories found:
+
+1. Commit/PR-to-release-note generators.
+   Examples: CommitFlow, KittyLog, changelogs.so, WhatShipped, ReleasePad,
+   NoteshipAI, Changesmith, CodeTrace, AutoReleaseNote. These generally connect
+   to GitHub/GitLab/Bitbucket, read commits, PRs, release tags, or sometimes
+   file diffs, and generate customer-facing release notes.
+
+2. Product-update distribution platforms.
+   Examples: AnnounceKit, Beamer, LaunchNotes, ChangeCrab. These focus on
+   hosted changelog pages, widgets, email, Slack, RSS, segmentation, feedback,
+   and analytics. AI drafting is increasingly a feature, not the whole product.
+
+3. Release-note aggregators and watcher products.
+   Examples: Releasebot and Patchday. These serve readers who want one feed or
+   digest across many vendors/products, often with summaries and alerts.
+
+The strongest gap for this project is not generic AI release-note generation.
+That market is crowded. The defensible angle is "artifact-grounded changelogs
+for AI/dev tools where upstream notes are incomplete, source is minified, or
+shipped behavior differs from commit messages."
+
+* Hypotheses
+
+** H1: Subscriber distribution layer first
+:PROPERTIES:
+:STATUS: proposed
+:END:
+
+Add RSS/Atom/JSON Feed, email digest, Discord/Slack/webhook fan-out, and a
+small public archive before building account-heavy SaaS features. This uses the
+existing artifacts and creates immediate value for the friends already reading
+the Discord posts.
+
+** H2: Premium reader tier
+:PROPERTIES:
+:STATUS: proposed
+:END:
+
+Offer higher frequency, early access, custom filters, per-project watchlists,
+weekly/daily digests, API access, and archived search. Keep public/free users
+on delayed or daily digest delivery.
+
+** H3: Requested project analysis
+:PROPERTIES:
+:STATUS: proposed
+:END:
+
+Allow paid users to request changelogs for a project. Inputs can include a
+public repo/tag range, private repo token, uploaded source archive, npm package,
+binary bundle, or app artifact. Price this by complexity and compute cost.
+
+** H4: Premium artifact intelligence
+:PROPERTIES:
+:STATUS: proposed
+:END:
+
+Differentiate from commit-based competitors with source/binary-specific
+features: semantic diffs, string extraction, feature-flag discovery, protocol
+schema diffs, risk/severity labels, "what changed beyond official notes", and
+evidence links.
+
+* Initial Recommendation
+
+Start with a reader-focused product:
+- Static/public archive with per-project pages.
+- RSS/Atom/JSON Feed per project and combined feed.
+- Email digest and Discord/Slack/webhook subscribers.
+- Premium frequency and filters.
+- "Request a project" paid queue.
+
+This path reuses the current generation pipeline and postpones harder SaaS
+surface area like private repo OAuth, upload security, custom tenant isolation,
+and review workflows.
+
+* Sources Checked
+
+- Local: =README.org=, =tools/sync.py=, =tools/agent_runner.py=, =tools/post.py=,
+  =~/.local/bin/ai-cli-changelog-sync=, mcron config in =~/config=, latest
+  generated Claude Code and Codex changelogs.
+- Web: CommitFlow, ReleasePad, KittyLog, changelogs.so, WhatShipped,
+  Releasebot, Patchday, AnnounceKit, Beamer, LaunchNotes, ChangeCrab,
+  GitHub automatically generated release notes documentation.

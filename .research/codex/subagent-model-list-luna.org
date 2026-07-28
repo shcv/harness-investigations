@@ -1,0 +1,169 @@
+#+TITLE: Codex subagent model list: why only Sol/Terra (no Luna)
+#+DATE: 2026-07-24
+#+STATUS: resolved
+#+SOURCE_VERSION: rust-v0.145.0
+
+* Problem Statement
+
+Codex multi-agent spawn only exposes Sol and Terra as subagent model
+overrides. Luna is a first-class GPT-5.6 tier for smaller/faster work, but it
+does not appear as a spawn_agent model option. What builds that list, how is
+it configured, and can Luna be made available?
+
+* Context
+
+- Archived source updated to =rust-v0.145.0= via =tools/sync.py --project codex --latest=.
+- User runs =codex-cli 0.145.0= with =model = "gpt-5.6-terra"=.
+- User cache =~/.codex/models_cache.json= matches bundled catalog:
+  - =gpt-5.6-sol= → =multi_agent_version: v2=
+  - =gpt-5.6-terra= → =multi_agent_version: v2=
+  - =gpt-5.6-luna= → =multi_agent_version: v1=
+
+* Findings
+
+** What determines the spawn model list
+
+When Multi-Agent V2 is active, =spawn_agent= builds its "Available model
+overrides" list in:
+
+- =codex-rs/core/src/tools/handlers/multi_agents_spec.rs=
+  (=spawn_agent_models_description=)
+- filter helper =model_supports_multi_agent_backend= in
+  =codex-rs/core/src/tools/handlers/multi_agents_common.rs=
+
+Pipeline:
+
+1. Start from the live model catalog (bundled =models.json=, remote ChatGPT
+   catalog, and/or =model_catalog_json= override).
+2. Keep models with =show_in_picker= (catalog =visibility: list=).
+3. Keep models that pass =model_supports_multi_agent_backend=:
+   #+begin_src rust
+   multi_agent_version != MultiAgentVersion::V2
+       || model.multi_agent_version == Some(multi_agent_version)
+   #+end_src
+   Under V2, only models whose catalog entry has =multi_agent_version: v2=
+   remain.
+4. Cap at =MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5=.
+
+The same filter is used when validating an explicit =spawn_agent.model=
+argument (=find_spawn_agent_model_name=). Unknown / ineligible models get:
+
+=Unknown model `…` for spawn_agent. Available models: …=
+
+** Why Luna is missing
+
+In =codex-rs/models-manager/models.json= (and the remote cache):
+
+| slug           | multi_agent_version | role                         |
+|----------------+---------------------+------------------------------|
+| gpt-5.6-sol    | v2                  | flagship / hard tasks        |
+| gpt-5.6-terra  | v2                  | balanced everyday / "mini"   |
+| gpt-5.6-luna   | *v1*                | fast/cheap "nano" tier       |
+
+Session is V2 because =Feature::MultiAgentV2= forces
+=multi_agent_version_override() → V2=
+(=core/src/config/mod.rs=). Luna is therefore filtered out of the spawn
+override list by design, not by a local config mistake.
+
+Product intent (from bundled skill docs): Terra is the mini-like worker;
+Luna is nano-like / high-throughput, and is *not* marked multi-agent-v2 capable.
+
+** What is configurable (and what is not)
+
+Configurable:
+
+- =[agents] default_subagent_model= / =default_subagent_reasoning_effort=
+  — default when spawn omits model. Still must pass the V2 eligibility filter.
+  Setting this to =gpt-5.6-luna= will *fail* under V2.
+- =[features.multi_agent_v2] expose_spawn_agent_model_overrides=
+  — whether the =model= / =reasoning_effort= fields and the override list
+  appear at all (default true in current defaults).
+- =[agents.<role>]= with a role config file that sets =model = "gpt-5.6-luna"=
+  — role application runs *after* model-override validation and does *not*
+  re-check multi-agent eligibility. This is a real bypass for pin-to-Luna
+  via =agent_type=.
+- =model_catalog_json = "/abs/path/catalog.json"=
+  — replaces the startup catalog. You can retag Luna as
+  =multi_agent_version: "v2"= so it appears in the list and can be selected
+  via =model= / =default_subagent_model=. Startup-only; must contain ≥1 model.
+
+Not a simple toggle:
+
+- There is no =allowed_subagent_models= list in config.
+- You cannot flip one model's =multi_agent_version= without a full catalog
+  override (or shipping a new Codex binary / waiting on OpenAI catalog).
+
+* Workarounds
+
+** Recommended product-aligned: use Terra for small multi-agent tasks
+
+Terra is the V2-eligible cheaper tier. Prefer:
+
+#+begin_src toml
+[agents]
+default_subagent_model = "gpt-5.6-terra"
+default_subagent_reasoning_effort = "low"
+#+end_src
+
+** Role pin to Luna (works without catalog change)
+
+#+begin_src toml
+[agents.fast]
+description = "Cheap Luna worker for small bounded tasks"
+config_file = "/home/shcv/.codex/agents/fast.toml"
+#+end_src
+
+=~/.codex/agents/fast.toml=:
+
+#+begin_src toml
+model = "gpt-5.6-luna"
+model_reasoning_effort = "medium"
+developer_instructions = "Stay narrow; do the assigned task only."
+#+end_src
+
+Spawn with =agent_type = "fast"= (and =fork_turns= not full-history if you
+need role model override semantics for V2). Role model is applied after
+spawn model validation, so Luna is used even though it is absent from the
+override list.
+
+Caveat: this is a client-side bypass of a catalog eligibility flag. Luna is
+not officially multi-agent-v2 tagged; behavior under V2 tooling may be
+unsupported.
+
+** Full catalog override (makes Luna a first-class spawn model)
+
+1. Copy bundled/cache catalog (e.g. =~/.codex/models_cache.json= models
+   array, or archive =models.json=).
+2. Set Luna's =multi_agent_version= to ="v2"=.
+3. Point config at it:
+
+#+begin_src toml
+model_catalog_json = "/home/shcv/.codex/custom-models.json"
+#+end_src
+
+4. Restart Codex (startup-only).
+
+Then =default_subagent_model = "gpt-5.6-luna"= and explicit =model=
+overrides should both accept Luna.
+
+* Conclusion
+
+The subagent model list is not a free-form config list. Under multi-agent
+V2 it is the picker-visible catalog models whose =multi_agent_version= is
+exactly =v2=, capped at 5. Luna is catalogued as =v1=, so it is excluded.
+Terra is the intended small/cheap V2 subagent. To force Luna: pin it via an
+agent role, or ship a =model_catalog_json= that retags Luna as V2.
+
+* Code map
+
+| Area                         | Path |
+|------------------------------+------|
+| Catalog                      | =codex-rs/models-manager/models.json= |
+| List filter                  | =core/src/tools/handlers/multi_agents_common.rs::model_supports_multi_agent_backend= |
+| Description builder          | =core/src/tools/handlers/multi_agents_spec.rs::spawn_agent_models_description= |
+| Spawn validation             | =multi_agents_common.rs::find_spawn_agent_model_name= |
+| V2 spawn handler             | =core/src/tools/handlers/multi_agents_v2/spawn.rs= |
+| Agents config                | =config/src/config_toml.rs::AgentsToml= |
+| V2 feature force             | =core/src/config/mod.rs::multi_agent_version_override= |
+| Catalog override             | =model_catalog_json= → =Config::model_catalog= |
+| Role model pin               | =core/src/agent/role.rs= applied after model override |

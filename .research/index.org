@@ -1,0 +1,7 @@
+#+TITLE: Research Index
+
+* Business
+- [[./business/ai-changelog-services.org][AI changelog services and expansion options]]
+
+* Codex
+- [[./codex/subagent-model-list-luna.org][Subagent model list: why only Sol/Terra (no Luna)]]
