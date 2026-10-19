@@ -1,222 +1,63 @@
-#+TITLE: Contributing to Agent Experiments
+#+TITLE: Contributing to Harness Investigations
 
-* Welcome Contributors!
+* Scope
 
-We're excited to have you contribute to our collective understanding of LLM agent capabilities and limitations. This guide will help you get started.
+This repository contains source-backed harness documentation, reproducible
+experiments, and the archive/changelog pipeline. Keep changes focused on one
+of those purposes. Preserve unrelated local work and generated archives.
 
-* Code of Conduct
+* Documentation and experiments
 
-- Be respectful and constructive in all interactions
-- Focus on reproducible, scientific approaches
-- Share both successes and failures - negative results are valuable
-- Credit others' work appropriately
+Use org-mode for documentation, descriptive lowercase filenames, and a
+=#+TITLE:= line. Put user-facing behavior under =features/=, implementation
+explanations under =internals/=, and reusable procedures under =docs/=.
+Update the relevant index when adding a document.
 
-* How to Contribute
+For claims about a harness, record the inspected version, source path, and
+supporting lines or runtime evidence. Distinguish released behavior from
+unreleased source, experiments, and inference. Recheck version-sensitive
+claims before presenting them as current.
 
-** Reporting a Challenge
+Experiments belong in a self-contained directory under =experiments/=. Include:
 
-1. Check existing issues to avoid duplicates
-2. Create a new issue with the =challenge= label
-3. Use the challenge template:
-   #+begin_example
-   **Challenge Type**: [direction-following | error-recovery | context-management | etc.]
-   **Severity**: [minor | moderate | severe]
-   **Frequency**: [rare | occasional | frequent]
-   
-   **Description**:
-   Clear description of the problematic behavior
-   
-   **Reproduction Steps**:
-   1. Step-by-step instructions
-   2. Include relevant context/files
-   
-   **Expected Behavior**:
-   What should happen
-   
-   **Actual Behavior**:
-   What actually happens
-   
-   **Environment**:
-   - Claude Code version:
-   - OS:
-   - Relevant settings:
-   #+end_example
+- The question or hypothesis and the configuration used.
+- Reproduction commands, inputs, and session or artifact references.
+- Observations, negative results, and limitations.
+- Quantitative results with the number of trials when applicable.
 
-** Proposing an Experiment
+Do not commit credentials, personal session transcripts, or raw source archives.
+Use [[./docs/experiment-template.org][the experiment template]] where it fits, and
+[[./docs/evaluation-methods.org][evaluation methods]] for measurement guidance.
 
-1. Create an issue with the =experiment= label
-2. Include:
-   - Hypothesis to test
-   - Challenge(s) being addressed
-   - Proposed methodology
-   - Success criteria
-   - Expected timeline
+* Pipeline changes
 
-3. Tag relevant team members for input
-4. Wait for feedback before starting major experiments
+Read [[./docs/changelog-operations.org][Changelog Operations]] before modifying scheduling, source extraction,
+authentication, generation, or publication. The service wrapper and scheduler
+configuration live in =~/config=, while the processing code lives here.
+Changes to either side should be explained together when they affect behavior.
 
-** Running an Experiment
+Install Node dependencies with =npm ci=. Validate Python changes with
+=python3 -m unittest discover -s tests -v= and
+=python3 -m py_compile tools/*.py=. Use =git diff --check= for whitespace.
+Add focused regressions for bugs that could skip work, publish bad output,
+duplicate messages, or commit unrelated files. Mock external services in tests;
+use an explicitly scoped live run to verify authentication or delivery.
 
-1. Create a branch: =experiments/<username>/<descriptive-name>=
-2. Set up your experiment directory:
-   #+begin_src bash
-   mkdir -p experiments/$(date +%Y-%m-%d)-<experiment-name>
-   cd experiments/$(date +%Y-%m-%d)-<experiment-name>
-   mkdir sessions artifacts
-   #+end_src
+Report exactly what the checks prove. Passing offline tests is not evidence
+that a scheduled job has run or a webhook has received a message.
 
-3. Document your setup in =setup.org=
-4. Run your experiment (Claude Code sessions are saved automatically)
-5. Record results in =results.org=
-6. Commit and push your branch
-7. Create a PR to =develop= branch
+* Review and Git workflow
 
-** Contributing Methods
+The current integration branch is =main=. Use a focused branch or local change
+for review; the repository does not use a separate =develop= integration flow.
+A review should explain the problem, resulting behavior, validation, and any
+remaining limitations. Keep documentation about the current implementation.
 
-1. Document your method in =methods/<category>/<method-name>.org=
-2. Include:
-   - Rationale
-   - Step-by-step instructions
-   - Example usage
-   - Known limitations
-   - Performance characteristics
+Source changes and service restoration do not imply permission to commit or
+push those changes. Automatic archive commits are a separate, configured
+service behavior. Keep generated content and code changes distinguishable.
 
-3. Link to experiments that validate the method
-
-* Style Guidelines
-
-** Org-mode Documents
-
-- Use descriptive headings
-- Include =#+TITLE:= at the top
-- Use code blocks with appropriate language tags
-- Add =:PROPERTIES:= drawers for metadata when needed
-
-** File Naming
-
-- Use lowercase with hyphens: =my-experiment-name=
-- Date format: =YYYY-MM-DD=
-- Be descriptive but concise
-
-** Code Examples
-
-When including code in experiments:
-- Use minimal, focused examples
-- Remove unnecessary complexity
-- Include comments explaining key points
-- Ensure code is reproducible
-
-* Review Process
-
-1. All contributions go through PR review
-2. At least one team member must approve
-3. For experiments:
-   - Verify reproducibility
-   - Check documentation completeness
-   - Validate conclusions match data
-
-4. For methods:
-   - Test the method independently
-   - Verify it addresses stated challenges
-   - Ensure clear instructions
-
-* Branching and Merging
-
-** Branch Types
-
-- =main= - Stable, reviewed content
-- =develop= - Integration branch
-- =experiments/<username>/<name>= - Individual experiments
-- =feature/<description>= - New features/tools
-
-** Merge Strategy
-
-1. Create feature/experiment branches from =develop=
-2. PR to =develop= for review
-3. After testing and review, PR from =develop= to =main=
-4. Use squash merges for cleaner history
-
-* Documentation Standards
-
-** Experiment Documentation
-
-Every experiment must include:
-
-1. =setup.org= with:
-   - Date and author
-   - Challenge being addressed
-   - Method being tested
-   - Testbed used
-   - Claude Code configuration
-
-2. =sessions/= directory with:
-   - Session UUID references or notes
-   - Claude Code automatically saves full sessions to =~/.claude/projects/[project-path]/UUID.jsonl=
-   - Use =/status= command to get the current session UUID
-
-3. =results.org= with:
-   - Quantitative metrics
-   - Qualitative observations
-   - Comparison to baseline
-   - Conclusions
-
-4. =artifacts/= with:
-   - Generated code
-   - Screenshots
-   - Other outputs
-
-** Challenge Documentation
-
-Each challenge directory must have:
-- =README.org= describing the challenge
-- =examples/= with concrete instances
-- =metrics.org= defining success criteria
-
-* Testing and Validation
-
-** For Methods
-
-- Test on at least 2 different challenges
-- Document success rate
-- Include edge cases
-- Provide counter-examples where method fails
-
-** For Experiments
-
-- Run multiple trials when possible
-- Control variables carefully
-- Document all configuration changes
-- Include statistical analysis where appropriate
-
-* Communication
-
-** Issues
-
-- Use issue templates
-- Tag relevant people with @mentions
-- Link related issues/PRs
-- Update status regularly
-
-** Pull Requests
-
-- Reference the issue being addressed
-- Summarize changes in PR description
-- Include key findings in PR body
-- Request specific reviewers
-
-** Discussions
-
-- Use GitHub Discussions for broader topics
-- Keep issues focused on specific items
-- Share weekly updates in team channel
-
-* Resources
-
-- [[./docs/experiment-template.org][Experiment Template]]
-- [[./docs/best-practices.org][Best Practices Guide]]
-- [[https://docs.anthropic.com/en/docs/build-with-claude/claude-code][Claude Code Documentation]]
-- [[https://github.com/anthropics/claude-code][Claude Code Repository]]
-
-* Questions?
-
-Open an issue with the =question= label or reach out in our team discussion channel.
+When committing, follow the shared agent instructions: write the complete
+message to =commit-msg=, commit with =git commit -F commit-msg=, remove the
+message after success, and use an =Assisted-by:= trailer naming the assistant
+and precise model variant.

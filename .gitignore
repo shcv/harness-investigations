@@ -18,10 +18,18 @@ refs/
 
 # Temp directory for sync tool
 .sync-temp/
+.sync-temp-*/
+archive/*/.github-release-cache.json
+archive/*/.github-release-cache.tmp
+archive/*/.delivery/
+archive/*/changelog/.drafts/
 
 # Dedicated cwd for SDK agent runs (keeps their sessions out of the
 # personal session bucket; never holds real content)
 .agent-cwd/
+
+# Bounded local agent transcripts (prompts, tool calls, outputs, errors)
+.agent-logs/
 
 # Environment variables
 .env
@@ -34,6 +42,7 @@ tools/config.py
 .last_posted_version_*
 .upload_state.json
 .upload_state_*.json
+.upload_state*.tmp
 .post_history.json
 
 # Python cache

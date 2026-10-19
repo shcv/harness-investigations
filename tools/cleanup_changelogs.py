@@ -14,7 +14,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 from colors import Colors, colored, print_success, print_warning, print_error
 
@@ -416,7 +416,6 @@ def cleanup_changelog(content: str, version: str) -> Tuple[str, bool]:
     Returns:
         tuple of (cleaned_content, was_modified)
     """
-    original_content = content
     modified = False
 
     # Apply each transformation in order

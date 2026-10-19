@@ -17,84 +17,10 @@ Usage: python3 verify_annotations.py [version] [--min-importance N]
   e.g.: python3 verify_annotations.py v2.1.48
 """
 import json
-import re
 import sys
 from pathlib import Path
 
-POSITIVE_TYPES = {"new_feature", "enhancement", "bug_fix", "infrastructure"}
-
-
-def extract_search_terms(ann: dict) -> list[str]:
-    """Extract verifiable search terms from annotation fields.
-
-    Priority order:
-    1. Known tool/feature names found in name/summary/evidence
-    2. Environment variable names (UPPERCASE_WITH_UNDERSCORES, 8+ chars)
-    3. CLI flag names (--flag-name), excluding generics
-    4. Long quoted strings from evidence (10+ chars)
-    5. Medium quoted strings as fallback
-    """
-    evidence = ann.get("evidence", "") or ""
-    if isinstance(evidence, list):
-        evidence = " ".join(str(e) for e in evidence)
-    name = ann.get("name", "") or ""
-    summary = ann.get("summary", "") or ""
-    combined = evidence + " " + name + " " + summary
-
-    candidates = []
-
-    # 1. Known tool/feature names — most reliable
-    KNOWN_FEATURES = [
-        "AskUserQuestion", "TodoWrite", "Skill", "ListMcpResources",
-        "CreateWorktree", "TaskCreate", "TaskUpdate", "TaskList",
-        "ListMcpResourcesTool", "SubagentStop", "PreToolUse", "PostToolUse",
-        "mcp-cli", "ENABLE_EXPERIMENTAL_MCP_CLI", "--mcp-cli",
-        "ConfigChange", "TaskCompleted", "HttpHook", "--worktree", "--tmux",
-        "tengu_crystal_beam", "tengu_tool_input_aliasing",
-        "claudeMdExcludes", "disableAllHooks", "remoteControlAtStartup",
-        "replBridgeEnabled", "mcp-needs-auth-cache",
-    ]
-    for n in KNOWN_FEATURES:
-        if n in combined:
-            candidates.append(n)
-            break
-
-    # 2. Environment variable names (distinctive, unlikely to appear generically)
-    GENERIC_ENV = {"CRITICAL", "IMPORTANT", "DISABLED", "ENABLED", "DEFAULT"}
-    env_vars = re.findall(r'\b([A-Z][A-Z0-9_]{7,})\b', combined)
-    candidates.extend(v for v in env_vars[:2] if v not in GENERIC_ENV)
-
-    # 3. CLI flags — skip generic ones
-    GENERIC_FLAGS = {
-        "--json", "--help", "--version", "--debug", "--verbose",
-        "--output", "--format", "--ignore", "--include", "--exclude",
-        "--timeout", "--host", "--port", "--path", "--config", "--log",
-    }
-    flags = [f for f in re.findall(r'(--[\w-]{4,})', combined) if f not in GENERIC_FLAGS]
-    candidates.extend(flags[:2])
-
-    # 4. Long quoted strings from evidence (10+ chars — very specific)
-    long_quoted = re.findall(r'"([^"]{10,})"', evidence)
-    candidates.extend(long_quoted[:2])
-
-    # 5. Medium quoted strings as fallback
-    if not candidates:
-        med_quoted = re.findall(r'"([^"]{6,})"', evidence)
-        candidates.extend(med_quoted[:3])
-
-    # Deduplicate, filter short/generic
-    seen = set()
-    result = []
-    for t in candidates:
-        if t not in seen and len(t) >= 6:
-            seen.add(t)
-            result.append(t)
-    return result[:4]
-
-
-def primary_term(terms: list[str]) -> "str | None":
-    """Return first (highest-priority) term only — avoids generic fallbacks masking true signals."""
-    return terms[0] if terms else None
+from annotation_summary import POSITIVE_CLAIM_TYPES as POSITIVE_TYPES, primary_evidence_term
 
 
 def verify_claims(version: str, min_importance: int = 2):
@@ -129,8 +55,7 @@ def verify_claims(version: str, min_importance: int = 2):
     removal_unverifiable = []     # no useful search terms
 
     for ann in removal_candidates:
-        terms = extract_search_terms(ann)
-        term = primary_term(terms)
+        term = primary_evidence_term(ann)
         if not term:
             removal_unverifiable.append(ann)
             continue
@@ -145,8 +70,7 @@ def verify_claims(version: str, min_importance: int = 2):
     positive_unverifiable = [] # no useful search terms
 
     for ann in positive_candidates:
-        terms = extract_search_terms(ann)
-        term = primary_term(terms)
+        term = primary_evidence_term(ann)
         if not term:
             positive_unverifiable.append(ann)
             continue
@@ -164,13 +88,13 @@ def verify_claims(version: str, min_importance: int = 2):
     print(f"  Unverifiable (no search terms):            {len(removal_unverifiable)}")
 
     if removal_false_positives:
-        print(f"\n  FALSE POSITIVE REMOVALS:")
+        print("\n  FALSE POSITIVE REMOVALS:")
         for ann, term in removal_false_positives:
             print(f"    [{ann['importance']}] {ann['name']}: {ann.get('summary','')[:70]}")
             print(f"      Found '{term}' in {version} source → still present")
 
     if removal_confirmed:
-        print(f"\n  CONFIRMED REMOVALS:")
+        print("\n  CONFIRMED REMOVALS:")
         for ann, term in removal_confirmed:
             print(f"    [{ann['importance']}] {ann['name']}: {ann.get('summary','')[:70]}")
             print(f"      '{term}' not in source ✓")
@@ -183,7 +107,7 @@ def verify_claims(version: str, min_importance: int = 2):
     print(f"  Unverifiable (no search terms): {len(positive_unverifiable)}")
 
     if positive_unverified:
-        print(f"\n  SUSPICIOUS POSITIVE CLAIMS (evidence term not in new source):")
+        print("\n  SUSPICIOUS POSITIVE CLAIMS (evidence term not in new source):")
         for ann, term in positive_unverified:
             ct = ann.get("change_type", "?")
             print(f"    [{ann['importance']}][{ct}] {ann['name']}: {ann.get('summary','')[:70]}")

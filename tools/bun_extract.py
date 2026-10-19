@@ -4,13 +4,16 @@
 Starting with @anthropic-ai/claude-code v2.1.113, the npm package is a thin
 wrapper and the real CLI ships as a Bun-compiled executable in platform
 sibling packages (@anthropic-ai/claude-code-linux-x64 etc.). The binary is
-an ELF (or Mach-O/PE) with a dedicated `.bun` section holding a single
+an ELF with a dedicated `.bun` section. Older releases hold a single
 pre-bundled CJS module wrapped in:
 
     (function(exports, require, module, __filename, __dirname) { ... })
 
-This module reads the ELF section directly (no objcopy dependency) and
-shells out to `node -e` with acorn's tokenizer to find the matched closing
+Split-module releases use a compiled module table instead. Their original
+sources are retained and combined with esbuild for analysis, without execution.
+
+This module reads the ELF section directly (no objcopy dependency) and, for
+older single-wrapper releases, shells out to `node -e` with acorn's tokenizer to find the matched closing
 paren of the top-level expression. Acorn is required because minified
 bundles contain regex literals that fool a naive brace counter.
 
@@ -19,6 +22,7 @@ Usage as CLI:
 """
 from __future__ import annotations
 
+import json
 import struct
 import subprocess
 import sys
@@ -40,16 +44,18 @@ for (const t of toks) {
     if (--depth === 0) { end = t.end; break; }
   }
 }
-process.stdout.write(String(end));
+process.stdout.write(String(Buffer.byteLength(src.slice(0, end), 'utf8')));
 """
 
 
 def find_bun_section(binary: bytes) -> bytes:
     """Return the contents of the ELF64 `.bun` section."""
-    if binary[:4] != b"\x7fELF":
+    if len(binary) < 64 or binary[:4] != b"\x7fELF":
         raise ValueError("not an ELF binary")
     if binary[4] != 2:
         raise ValueError("only ELF64 is supported (claude binaries are 64-bit)")
+    if binary[5] != 1:
+        raise ValueError("only little-endian ELF is supported")
     e_shoff = struct.unpack_from("<Q", binary, 0x28)[0]
     e_shentsize = struct.unpack_from("<H", binary, 0x3A)[0]
     e_shnum = struct.unpack_from("<H", binary, 0x3C)[0]
@@ -71,6 +77,66 @@ def find_bun_section(binary: bytes) -> bytes:
     raise RuntimeError(f"no {BUN_SECTION!r} section found in ELF")
 
 
+def read_module_graph(section: bytes) -> dict[str, str]:
+    """Read source ranges from Bun's compiled module table, never bytecode.
+
+    Layout: an eight-byte section length, payload, 32-byte Offsets, trailer.
+    CompiledModuleGraphFile has six StringPointers and four enum bytes in the
+    split-module binaries (52 bytes). See Bun's StandaloneModuleGraph source:
+    https://github.com/oven-sh/bun/blob/main/src/standalone_graph/StandaloneModuleGraph.rs
+    Unknown layouts fail closed instead of archiving a partial JS snippet.
+    """
+    trailer = b"\n---- Bun! ----\n"
+    if len(section) < 56 or not section.endswith(trailer):
+        raise RuntimeError("missing Bun module graph trailer")
+    size = struct.unpack_from('<Q', section)[0]
+    if size != len(section) - 8:
+        raise RuntimeError("invalid Bun section length")
+    payload = section[8:]
+    footer = len(payload) - len(trailer) - 32
+    byte_count, table, table_size, entry, _, _, _ = struct.unpack_from('<QIIIIII', payload, footer)
+    if byte_count != footer or table_size % 52 or table + table_size > footer:
+        raise RuntimeError("unsupported or invalid Bun module table")
+    if entry >= table_size // 52:
+        raise RuntimeError("invalid Bun entry point")
+
+    def read_range(offset: int, length: int) -> bytes:
+        if offset + length > table:
+            raise RuntimeError("Bun source range is outside the payload")
+        return payload[offset:offset + length]
+
+    modules = {}
+    for row in range(table, table + table_size, 52):
+        name_at, name_len, source_at, source_len = struct.unpack_from('<IIII', payload, row)
+        encoding, _, module_format, _ = struct.unpack_from('<BBBB', payload, row + 48)
+        name = read_range(name_at, name_len).decode('utf-8').rstrip('\0')
+        if not name.startswith('/$bunfs/root/') or '\0' in name:
+            raise RuntimeError("unsupported Bun module path")
+        if module_format not in (1, 2):
+            continue
+        if encoding not in (1, 2):
+            raise RuntimeError(f"unsupported JavaScript encoding for {name}")
+        source = read_range(source_at, source_len)
+        if not source or b'\0' in source or name in modules:
+            raise RuntimeError(f"missing or invalid source for {name}")
+        # Bun's latin1 enum labels raw source bytes; these bundles carry UTF-8.
+        modules[name] = source.decode('utf-8')
+    if not modules:
+        raise RuntimeError("Bun module table contains no JavaScript sources")
+    return modules
+
+
+def rebundle_modules(modules: dict[str, str], project_root: Path) -> bytes:
+    result = subprocess.run(
+        ['node', str(project_root / 'tools' / 'rebundle_bun.js')],
+        input=json.dumps(modules).encode('utf-8'), capture_output=True,
+        cwd=project_root, timeout=180, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"Bun source rebundling failed: {result.stderr.decode(errors='replace')[-2000:]}")
+    return result.stdout
+
+
 def find_js_end(js_chunk: bytes, project_root: Path) -> int:
     """Return the byte length of the outermost (function(...)) in `js_chunk`."""
     result = subprocess.run(
@@ -86,7 +152,7 @@ def find_js_end(js_chunk: bytes, project_root: Path) -> int:
     return end
 
 
-def extract_cli_js(binary_path: Path, project_root: Path) -> bytes:
+def extract_cli_js(binary_path: Path, project_root: Path, modules_path: Path | None = None) -> bytes:
     """Extract the CLI body from a Bun-compiled claude binary.
 
     The embedded JS is wrapped in (function(exports, require, module, __filename,
@@ -99,7 +165,11 @@ def extract_cli_js(binary_path: Path, project_root: Path) -> bytes:
     section = find_bun_section(binary)
     start = section.find(WRAPPER_MARKER)
     if start < 0:
-        raise RuntimeError("CLI wrapper marker not found in .bun section")
+        modules = read_module_graph(section)
+        snapshot = rebundle_modules(modules, project_root)
+        if modules_path is not None:
+            modules_path.write_text(json.dumps(modules, ensure_ascii=False) + '\n')
+        return snapshot
     # 30 MB window — current CLI is ~13 MB, leaving generous headroom.
     window = section[start : start + 30 * 1024 * 1024]
     end = find_js_end(window, project_root)

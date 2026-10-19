@@ -1,0 +1,151 @@
+#+TITLE: Claude Code changelog model replay, 2026-09-13
+
+* Question
+
+Would stronger Codex models recover the user-facing changes that the existing
+Terra-based changelog workflow missed in Claude Code 2.1.242--2.1.245, using the
+same candidate build from =../astdiff-changelog=?  A later check also asks
+whether the archived 2.1.170 changelog is correct.
+
+* Controlled setup
+
+- Models: =gpt-5.6-sol= and =gpt-6-astra=, both at =medium= reasoning.
+- Diff implementation:
+  =/home/shcv/.local/lib/harness-investigations/astdiff/239893c-changelog-2d340ca5ca52/astdiff=.
+- The replay archives were isolated from one another.  Prompts explicitly
+  prohibited reading archived changelogs, prior audits, replay reports, and
+  Codex memory.  An audit of all eight event logs found no command that read
+  those paths.
+- Each run could inspect the filtered astdiff, string diff, and the old and new
+  pretty-printed bundles.  This tests semantic interpretation after diff
+  construction; it does not test a model forced to use only the diff.
+- Full prompts, tool calls, outputs, metadata, and final answers were copied out
+  of the runner's rotating log directory immediately after each run.
+
+The runner records =read_roots= as provenance, but the Codex backend currently
+uses a filesystem-wide read-only sandbox and does not enforce those roots.
+Isolation in this experiment therefore comes from the prompt and the trace
+audit, not an operating-system access boundary.
+
+* Results for 2.1.242--2.1.245
+
+| Version | Known high-value findings | Sol | Astra |
+|---------+---------------------------+-----+-------|
+| 2.1.242 | main/subagent prompt-cache TTLs and env controls; hidden =--no-home-settings= stub; =thinking.display= rejection retry | all recovered | all recovered |
+| 2.1.243 | =ENABLE_LSP_TOOL= gate removed while LSP-server readiness remains | recovered | recovered |
+| 2.1.245 | new text-returning =/autofix-pr= adapter and module split; no new reachable CLI registration | recovered | recovered |
+
+Both stronger models produced three acceptable semantic summaries out of three.
+The earlier Terra replay produced one good and one bad answer from identical
+2.1.243 evidence, missed the 2.1.242 TTL and cloud-settings details, and largely
+dismissed the 2.1.245 adapter change.  Model strength materially improves this
+sample, but the remaining run-to-run variance and the amount of source
+exploration make it unsuitable as the only correctness control.
+
+Sol was especially explicit that the 2.1.242 home-settings planner was still a
+stub.  Astra identified the same feature as in development, but described that
+boundary less precisely.
+
+** Runtime and usage
+
+The input figures below are cumulative usage reported by the CLI over each
+agent turn.  They are not a single-context size or a direct price calculation.
+
+| Model | Version | Seconds | Command events | Input tokens | Cached input | Output tokens | Reasoning output |
+|-------+---------+---------+----------------+--------------+--------------+---------------+------------------|
+| Sol | 2.1.242 | 502.82 | 41 | 6,131,908 | 5,901,440 | 18,915 | 7,249 |
+| Sol | 2.1.243 | 398.93 | 24 | 1,622,562 | 1,523,328 | 14,869 | 4,610 |
+| Sol | 2.1.245 | 318.18 | 34 | 4,111,152 | 3,950,720 | 12,175 | 4,454 |
+| Sol total | | 1,219.93 | 99 | 11,865,622 | 11,375,488 | 45,959 | 16,313 |
+| Astra | 2.1.242 | 857.03 | 68 | 6,676,880 | 6,410,880 | 18,072 | 2,178 |
+| Astra | 2.1.243 | 224.30 | 16 | 1,243,870 | 1,146,752 | 5,491 | 384 |
+| Astra | 2.1.245 | 314.07 | 19 | 1,608,271 | 1,505,792 | 7,528 | 958 |
+| Astra total | | 1,395.40 | 103 | 9,529,021 | 9,063,424 | 31,091 | 3,520 |
+
+** Preserved evidence
+
+- Sol:
+  [[file:../.sync-temp-astdiff-model-replay-20260913/sol/archive/claude-code/changelog/changelog-v2.1.242.md][2.1.242]],
+  [[file:../.sync-temp-astdiff-model-replay-20260913/sol/archive/claude-code/changelog/changelog-v2.1.243.md][2.1.243]],
+  [[file:../.sync-temp-astdiff-model-replay-20260913/sol/archive/claude-code/changelog/changelog-v2.1.245.md][2.1.245]], and
+  [[file:../.sync-temp-astdiff-model-replay-20260913/sol/sessions][session logs]].
+- Astra:
+  [[file:../.sync-temp-astdiff-model-replay-20260913/astra/archive/claude-code/changelog/changelog-v2.1.242.md][2.1.242]],
+  [[file:../.sync-temp-astdiff-model-replay-20260913/astra/archive/claude-code/changelog/changelog-v2.1.243.md][2.1.243]],
+  [[file:../.sync-temp-astdiff-model-replay-20260913/astra/archive/claude-code/changelog/changelog-v2.1.245.md][2.1.245]], and
+  [[file:../.sync-temp-astdiff-model-replay-20260913/astra/sessions][session logs]].
+
+* 2.1.170 audit
+
+The archived 2.1.170 changelog was broken in several material ways.  It was not
+wholly fabricated: Fable is an official release highlight, and many of its
+lower-level observations are real.  The errors were:
+
+1. It called =model_refusal_fallback= a new emitted event.  Version 2.1.169
+   already emitted the event; 2.1.170 exports its schema and enriches metadata.
+2. It missed the highest-impact refusal change.  The old eligibility function
+   required the default-off =tengu_loggia_carousel= gate; the new function only
+   checks =CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=.
+3. It reduced the official VS Code/inherited-environment repair to prompt
+   history.  Removing the shared =HkH()= predicate also restores transcript
+   persistence and session registration, which makes =--resume= work.
+4. It reversed the credit-required 429 exception.  =fetch_error= and
+   =org_level_disabled_until= continue through ordinary retry handling; the
+   other matching credit-required responses are non-retryable.
+5. It presented Fable as universally available.  The CLI checks account and
+   provider model options and can report it unavailable.
+6. Its provenance names =changes-v2.1.170-2.md=, which is not present in the
+   current archive, so the exact generation input cannot now be resolved.
+
+The new candidate astdiff matches 25,724 of 25,753 declarations (99.7%), with
+66 additions, 29 removals, 10,620 structural changes, and 37 string-only
+changes.  That confirms the matcher is working, but it also leaves a very large
+semantic review surface.
+
+A clean Sol replay found the Fable availability boundary, refusal-gate removal,
+server-fallback tombstone handling, and dark task-continuity prompt.  It omitted
+the official transcript/resume fix and several valid secondary changes.  Astra
+gave the more complete 2.1.170 result, including persistence, model handling,
+fallback behavior, caching, picker behavior, and tombstone cancellation.  The
+source-checked correction is now the canonical
+[[file:../archive/claude-code/changelog/changelog-v2.1.170.md][2.1.170 changelog]].
+
+| Model | Seconds | Command events | Input tokens | Cached input | Output tokens | Reasoning output |
+|-------+---------+----------------+--------------+--------------+---------------+------------------|
+| Sol | 323.28 | 30 | 3,845,692 | 3,630,464 | 12,659 | 4,888 |
+| Astra | 393.19 | 23 | 2,821,468 | 2,628,736 | 9,119 | 1,551 |
+
+Preserved clean outputs:
+[[file:../.sync-temp-astdiff-model-replay-20260913/sol-170/archive/claude-code/changelog/changelog-v2.1.170.md][Sol]],
+[[file:../.sync-temp-astdiff-model-replay-20260913/astra-170/archive/claude-code/changelog/changelog-v2.1.170.md][Astra]], and their
+[[file:../.sync-temp-astdiff-model-replay-20260913/sol-170/sessions][Sol]] and
+[[file:../.sync-temp-astdiff-model-replay-20260913/astra-170/sessions][Astra session logs]].
+
+* Workflow repair
+
+The npm/GitHub split exposed a separate pipeline error: official GitHub release
+notes were fetched only for projects whose source artifact also came from
+GitHub.  Claude Code artifacts come from npm, so the generator never received
+the published =anthropics/claude-code= baseline.  =ProjectConfig= now has an
+independent release-notes repository and tag prefix, with Claude Code mapped to
+=anthropics/claude-code= and =v=.  Existing GitHub projects inherit their source
+repository defaults.
+
+The practical workflow should be:
+
+1. Use the candidate astdiff and retain its provenance and coverage metrics.
+2. Put official release notes first as a published baseline, even when the
+   source artifact comes from another registry.
+3. Require each material prose claim to identify old and new source evidence.
+4. Reject a no-change or low-impact answer when the diff contains high-signal
+   added settings, environment variables, CLI options, gates, or registrations.
+5. Keep the full session trace and run an acceptance review before publication.
+6. Enforce read roots in the runner rather than only recording them.
+
+A stronger model is useful for the semantic pass.  It does not replace those
+controls: both models consumed millions of cumulative input tokens and dozens
+of tool calls, and the 2.1.170 Sol run still missed the official headline fix.
+
+The scheduled service now uses =gpt-6-astra= at medium for the main changelog
+pass and =gpt-5.6-luna= at low for its optional annotation pass.  The
+evidence-aware acceptance checks remain necessary despite the stronger writer.

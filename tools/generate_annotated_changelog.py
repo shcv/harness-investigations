@@ -13,98 +13,21 @@ import os
 import sys
 from pathlib import Path
 
-from agent_runner import AgentRunRequest, default_model_for, make_agent_runner
+from annotation_summary import format_annotation_summary
+from agent_runner import (AgentRunRequest, DEFAULT_AGENT_PROVIDER, SUPPORTED_AGENT_PROVIDERS,
+                          default_model_for, load_project_env, make_agent_runner)
+
+load_project_env()
 
 MIN_IMPORTANCE = 2
-DEFAULT_AGENT_PROVIDER = (
-    os.getenv("CHANGELOG_AGENT_PROVIDER") or os.getenv("CHANGELOG_AGENT") or "claude"
-)
-DEFAULT_MODEL = os.getenv("CHANGELOG_AGENT_MODEL") or default_model_for(
-    DEFAULT_AGENT_PROVIDER, "changelog"
-)
-
 SYSTEM_PROMPT_PATH = Path("archive/claude-code/changelog/system-prompt.md")
-
-
-def format_annotations_for_prompt(annotations: list[dict], version: str) -> str:
-    """Format annotations compactly, tiered by importance.
-
-    Format per line:
-      [component/change_type] IMP name: summary (evidence)
-    Flags and disabled status are appended inline.
-    """
-    # Tier 1: importance 4-5
-    tier1 = sorted(
-        [a for a in annotations if a.get("importance", 0) >= 4],
-        key=lambda a: (-a.get("importance", 0), not a.get("user_facing", False))
-    )
-    # Tier 2: importance 3
-    tier2 = sorted(
-        [a for a in annotations if a.get("importance", 0) == 3],
-        key=lambda a: (not a.get("user_facing", False), a.get("component", ""))
-    )
-    # Tier 3: importance 1-2
-    tier3 = sorted(
-        [a for a in annotations if a.get("importance", 0) <= 2],
-        key=lambda a: a.get("component", "")
-    )
-
-    def fmt(ann: dict) -> str:
-        comp = ann.get("component", "?")
-        ct = ann.get("change_type", "?")[:8]
-        imp = ann.get("importance", "?")
-        name = ann.get("name", "?")
-        summary = ann.get("summary", "")
-        evidence = ann.get("evidence", "") or ""
-        if isinstance(evidence, list):
-            evidence = "; ".join(str(e) for e in evidence)
-        uf = "★" if ann.get("user_facing") else " "
-        flag = ann.get("feature_flag", "")
-        dis = ann.get("disabled", False)
-        flag_str = f" [{flag}{'!disabled' if dis else ''}]" if flag else ""
-        # Truncate for compactness
-        ev_short = evidence[:60].split("\n")[0] if evidence else ""
-        sum_short = summary[:80]
-        return f"  [{comp}/{ct}]{uf}i={imp} {name}: {sum_short} | {ev_short}{flag_str}"
-
-    lines = [
-        f"# Pre-analyzed Changes for {version}",
-        f"# Total: {len(annotations)} entries across 3 tiers",
-        "#",
-        "# Format: [component/type]★=user-facing i=importance | evidence [FLAG if gated]",
-        "# Tiers: HIGH=4-5 (lead features), NOTABLE=3 (improvements), LOW=1-2 (internal)",
-        "#",
-        "# INSTRUCTIONS:",
-        "# - HIGH items: include all user-facing (★) ones; summarize patterns for non-★",
-        "# - NOTABLE: include if clearly user-visible, skip pure infrastructure",
-        "# - LOW: use for context only; mention patterns (e.g. 'several internal refactors')",
-        "# - feature_flag items: if disabled, put in 'In Development' section",
-        "# - For removal/refactor items: the feature may still exist (reorganized code)",
-        "#   Only call it a removal if it makes sense from the user's perspective",
-        "",
-        f"## HIGH IMPORTANCE (i=4-5, {len(tier1)} items)",
-    ]
-    for ann in tier1:
-        lines.append(fmt(ann))
-
-    lines.append("")
-    lines.append(f"## NOTABLE (i=3, {len(tier2)} items)")
-    for ann in tier2:
-        lines.append(fmt(ann))
-
-    lines.append("")
-    lines.append(f"## LOW / INTERNAL (i=1-2, {len(tier3)} items — use for context)")
-    for ann in tier3:
-        lines.append(fmt(ann))
-
-    return "\n".join(lines)
 
 
 async def generate(
     version: str,
     min_importance: int = MIN_IMPORTANCE,
     agent_provider: str = DEFAULT_AGENT_PROVIDER,
-    model: str = DEFAULT_MODEL,
+    model: str | None = None,
     codex_reasoning_effort: str = "medium",
     codex_bin: str = "codex",
 ):
@@ -125,9 +48,10 @@ async def generate(
 
     user_prompt = f"""Generate a changelog for Claude Code {version}.
 
-{format_annotations_for_prompt(filtered, version)}
+{format_annotation_summary(filtered, version)}
 
 Generate the changelog following the standard format from the system prompt.
+Return the complete Markdown document as your final answer. Do not edit files.
 You do NOT need to read source files — the pre-analyzed changes above are your primary input.
 However, you may read the prettified source file (pretty/pretty-{version}.js) if you want to
 verify specific details or find additional context for important changes.
@@ -136,7 +60,7 @@ verify specific details or find additional context for important changes.
     print(f"\nGenerating annotated changelog for {version}...")
     runner = make_agent_runner(
         agent_provider,
-        model=model,
+        model=model or default_model_for(agent_provider, "changelog"),
         reasoning_effort=codex_reasoning_effort
         if agent_provider == "codex"
         else None,
@@ -154,7 +78,10 @@ verify specific details or find additional context for important changes.
         ),
     )
 
-    output_file.write_text(f"# Changelog for version {version}\n\n{result}")
+    changelog_dir.mkdir(parents=True, exist_ok=True)
+    if not result.lstrip().startswith("# "):
+        result = f"# Changelog for version {version.removeprefix('v')}\n\n{result}"
+    output_file.write_text(result, encoding="utf-8")
     print(f"Written to {output_file}")
 
 
@@ -164,11 +91,13 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("version", nargs="?", default="v2.1.48")
     p.add_argument("min_importance", nargs="?", type=int, default=MIN_IMPORTANCE)
+    p.add_argument("--min-importance", dest="min_importance_option", type=int)
     p.add_argument(
         "--agent-provider",
-        choices=("claude", "codex"),
-        default=DEFAULT_AGENT_PROVIDER,
-        help="Agent provider. Default: CHANGELOG_AGENT_PROVIDER or claude",
+        choices=SUPPORTED_AGENT_PROVIDERS,
+        default=os.getenv("CHANGELOG_AGENT_PROVIDER") or os.getenv("CHANGELOG_AGENT")
+        or DEFAULT_AGENT_PROVIDER,
+        help="Agent provider. Default: CHANGELOG_AGENT_PROVIDER or codex",
     )
     p.add_argument(
         "--model",
@@ -178,23 +107,20 @@ if __name__ == "__main__":
     p.add_argument(
         "--codex-reasoning-effort",
         choices=("low", "medium", "high", "xhigh"),
-        default=os.getenv("CHANGELOG_CODEX_REASONING_EFFORT") or "high",
+        default=os.getenv("CHANGELOG_CODEX_REASONING_EFFORT") or "medium",
     )
     p.add_argument(
         "--codex-bin",
         default=os.getenv("CHANGELOG_CODEX_BIN") or "codex",
     )
     args = p.parse_args()
-    if args.agent_provider not in ("claude", "codex"):
-        p.error("--agent-provider must be claude or codex")
-
-    model = args.model or os.getenv("CHANGELOG_AGENT_MODEL") or default_model_for(
+    model = args.model or os.getenv("CHANGELOG_AGENT_MODEL") or os.getenv("CHANGELOG_CHANGELOG_MODEL") or default_model_for(
         args.agent_provider, "changelog"
     )
     asyncio.run(
         generate(
             args.version,
-            args.min_importance,
+            args.min_importance_option if args.min_importance_option is not None else args.min_importance,
             agent_provider=args.agent_provider,
             model=model,
             codex_reasoning_effort=args.codex_reasoning_effort,

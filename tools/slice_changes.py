@@ -14,6 +14,7 @@ import json
 import sys
 from pathlib import Path
 from collections import Counter
+from pipeline_io import write_json
 
 
 SECTION_PATTERNS = {
@@ -31,11 +32,61 @@ SECTION_HEADER = re.compile(r'^=== (.+) ===$')
 # Regex to extract identifiers from minified JS bodies.
 # Matches JS identifiers (including $/_) preceded/followed by non-identifier chars.
 IDENT_RE = re.compile(r'(?<![A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)(?![A-Za-z0-9_$])')
+MAX_BATCH_CHARS = 60_000
+
+
+def bound_batches(batches: list[dict], max_chars: int = MAX_BATCH_CHARS) -> list[dict]:
+    """Bound requests even when one changed function is enormous.
+
+    Preserve every character; label partial code so absence in an excerpt is
+    not mistaken for a removed capability. Prefer splitting at line endings.
+    """
+    bounded = []
+    for batch in batches:
+        content = batch["content"]
+        if len(content) <= max_chars:
+            bounded.append({**batch, "id": len(bounded) + 1})
+            continue
+        context = "Original identifiers: " + ", ".join(batch["names"])
+        budget = max_chars - len(context) - 192
+        if budget < 1:
+            raise ValueError("max_chars is too small for the batch identifiers")
+        parts = []
+        start = 0
+        while start < len(content):
+            end = min(start + budget, len(content))
+            if end < len(content):
+                newline = content.rfind("\n", start + budget // 2, end)
+                if newline != -1:
+                    end = newline + 1
+            parts.append(content[start:end])
+            start = end
+        for index, part in enumerate(parts, 1):
+            prefix = (f"Partial batch excerpt {index}/{len(parts)}. "
+                      "Code may continue in other excerpts; do not infer removal from absence here.\n"
+                      f"{context}\n\n")
+            bounded.append({**batch, "id": len(bounded) + 1,
+                            "content": prefix + part, "_part": index, "_parts": len(parts)})
+    return bounded
+
+
+def write_batches(batches: list[dict], out: Path) -> None:
+    """Refresh slicer-owned inputs and discard batches no longer in the diff."""
+    out.mkdir(parents=True, exist_ok=True)
+    expected = {f"batch-{batch['id']:03d}.json" for batch in batches}
+    for path in out.glob("batch-*.json"):
+        match = re.fullmatch(r"(batch-[0-9]+)(?:-annotations)?\.json", path.name)
+        if match and match[1] + ".json" not in expected:
+            path.unlink()
+    for batch in batches:
+        write_json(out / f"batch-{batch['id']:03d}.json", batch)
 
 
 def parse_slices(path: Path) -> list[dict]:
     """Return list of {section, name, content} dicts, one per change block."""
-    lines = path.read_text().splitlines(keepends=True)
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    if any(line.startswith("diff --git ") for line in lines):
+        return parse_unified_slices(lines)
     slices = []
     current_section = None
     current_name = None
@@ -92,10 +143,46 @@ def parse_slices(path: Path) -> list[dict]:
     return slices
 
 
+def parse_unified_slices(lines: list[str]) -> list[dict]:
+    """Keep file context on each Git diff hunk for non-AST projects."""
+    slices = []
+    header = []
+    body = []
+    name = ""
+    section = "modified"
+
+    def flush():
+        if body:
+            slices.append({"section": section, "name": name,
+                           "content": "".join(header + body).rstrip()})
+
+    for line in lines:
+        if line.startswith("diff --git "):
+            flush()
+            header, body = [line], []
+            name = line.strip()
+            section = "modified"
+        elif line.startswith("@@ "):
+            flush()
+            body = [line]
+        elif body:
+            body.append(line)
+        else:
+            header.append(line)
+            if line.startswith("new file mode "):
+                section = "added"
+            elif line.startswith("deleted file mode "):
+                section = "removed"
+    flush()
+    return slices
+
+
 # ── Linear batching ───────────────────────────────────────────────────────────
 
 def make_batches(slices: list[dict], batch_size: int = 12) -> list[dict]:
     """Group slices into batches by section, each at most batch_size items."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
     from itertools import islice as _islice
 
     def chunked(iterable, n):
@@ -126,7 +213,7 @@ def make_batches(slices: list[dict], batch_size: int = 12) -> list[dict]:
                 "content": content,
             })
 
-    return batches
+    return bound_batches(batches)
 
 
 # ── Call graph batching ───────────────────────────────────────────────────────
@@ -196,7 +283,7 @@ def callgraph_stats(slices: list[dict], graph: dict, components: list[list[int]]
     edges = sum(len(nbrs) for nbrs in graph.values()) // 2
 
     print(f"\n{'='*60}")
-    print(f"CALL GRAPH STATISTICS")
+    print("CALL GRAPH STATISTICS")
     print(f"{'='*60}")
     print(f"  Nodes (changed functions): {n}")
     print(f"  Edges (cross-references):  {edges}")
@@ -209,7 +296,7 @@ def callgraph_stats(slices: list[dict], graph: dict, components: list[list[int]]
     print(f"  Median component size:     {sorted(sizes)[len(sizes)//2]}")
 
     # Histogram
-    print(f"\n  Component size distribution:")
+    print("\n  Component size distribution:")
     size_hist = Counter()
     for s in sizes:
         bucket = s if s <= 5 else (10 if s <= 10 else (20 if s <= 20 else (50 if s <= 50 else 999)))
@@ -232,7 +319,7 @@ def callgraph_stats(slices: list[dict], graph: dict, components: list[list[int]]
     # Hub nodes: high-degree nodes that connect many components
     degrees = [(len(graph[i]), slices[i]["name"]) for i in range(n)]
     degrees.sort(reverse=True)
-    print(f"\n  Top hub nodes (most connections):")
+    print("\n  Top hub nodes (most connections):")
     for deg, name in degrees[:10]:
         sec = slices[next(i for i in range(n) if slices[i]["name"] == name)]["section"]
         print(f"    {name:12s} [{sec:12s}] degree={deg}")
@@ -260,6 +347,8 @@ def make_batches_callgraph(
     "hub" nodes (popular utilities) and do NOT create edges to other nodes —
     they're placed in their own batch. Set 0 to disable (include all edges).
     """
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
     graph = build_call_graph(slices)
 
     if max_hub_degree > 0:
@@ -331,7 +420,7 @@ def make_batches_callgraph(
                 current_section = sec
 
     flush_batch()
-    return batches, graph, components
+    return bound_batches(batches), graph, components
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -383,11 +472,7 @@ def main():
 
     if args.out_dir:
         out = Path(args.out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        for b in batches:
-            (out / f"batch-{b['id']:03d}.json").write_text(
-                json.dumps(b, indent=2)
-            )
+        write_batches(batches, out)
         print(f"Wrote {len(batches)} batch files to {out}")
     elif not args.summary:
         json.dump(batches, sys.stdout, indent=2)

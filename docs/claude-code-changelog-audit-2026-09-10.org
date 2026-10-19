@@ -1,0 +1,284 @@
+#+TITLE: Claude Code changelog correctness audit: 2.1.242-2.1.247
+#+DATE: 2026-09-10
+
+* Verdict
+
+The 2.1.242 and 2.1.243 changelogs contain substantive omissions. They should
+not say that the changes are only Bun packaging noise. The archived sources
+and the rebundled analysis snapshots both retain evidence of actual changes.
+
+The 2.1.245 conclusion of no /verified user-facing change/ is consistent with
+this review, but its explanation should acknowledge an autofix-PR refactor and
+an additional text-returning adapter whose CLI registration was not found.
+This is a qualified finding, not a proof of whole-program equivalence.
+
+The npm registry currently lists 2.1.242, 2.1.243 and 2.1.245, but not 2.1.244.
+The appropriate archived comparison for 2.1.245 is therefore 2.1.243.
+
+Spot checks of 2.1.246 and 2.1.247 found additional overstatements about which
+features are new. Those versions have not received a complete audit here.
+
+* Findings
+
+** High: 2.1.242 incorrectly dismisses actual settings, flags and fixes
+
+Affected claim: [[file:../archive/claude-code/changelog/changelog-v2.1.242.md::5][summary]],
+which attributes the large diff to rebundling and the remaining strings to
+serialization; the final note says no new setting, environment variable,
+CLI flag or user-facing fix was verified.
+
+The following are absent from the archived 2.1.241 monolith and present in
+the original 2.1.242 modules. They also survive the analysis rebundle:
+
+- =promptCacheTtl= and =subagentPromptCacheTtl= settings accept =5m= or =1h=.
+  =CLAUDE_CODE_PROMPT_CACHE_TTL= and
+  =CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL= override the respective setting.
+  The resolver checks the main-conversation classification, the environment
+  overrides, settings and legacy TTL controls. =FORCE_PROMPT_CACHING_5M=
+  remains the first override.
+  - Schema: raw module =chunk-sa0fkdme.js=;
+    [[file:../archive/claude-code/pretty/pretty-v2.1.242.js::145324][pretty source]].
+  - Resolver: raw =chunk-rrz1yb6n.js=, function =uFr=;
+    [[file:../archive/claude-code/pretty/pretty-v2.1.242.js::842610][pretty source]].
+  - Four isolated evaluations of the actual resolver confirmed separate
+    main/subagent settings, environment precedence and forced-five-minute
+    precedence. These checks exercise selection, not a real API cache.
+
+- A hidden =--no-home-settings= option suppresses forwarding this machine's
+  settings into a cloud launch or attachment. Its parser validates that
+  =--cloud= or =--environment= is present and carries
+  =forwardHomeSettings: e.homeSettings !== false= downstream.
+  - Registration: raw =chunk-ntan8f1c.js=;
+    [[file:../archive/claude-code/pretty/pretty-v2.1.242.js::1643469][pretty source]].
+  - Validation/parsed result: raw =chunk-6hnk0ys9.js=;
+    [[file:../archive/claude-code/pretty/pretty-v2.1.242.js::1498518][pretty source]].
+  - This is registered but hidden from help, not evidence of a generally
+    advertised release feature.
+
+- Requests gain a retry path for rejected =thinking.display= updates.
+  When the matching beta header is present and the rejection predicate
+  matches, the code removes that beta/value, records the conversation state,
+  and returns =retry:thinking-display-updates=.
+  - Raw =chunk-rrz1yb6n.js=, callback =yr=;
+    [[file:../archive/claude-code/pretty/pretty-v2.1.242.js::844556][pretty source]].
+  - Search anchor: =tengu_thinking_display_rejected_retry=.
+  - This establishes a new fallback path; it does not establish a live
+    server incident or prove that all display errors are retried.
+
+These are enough to disprove the existing summary. This list is not a complete
+replacement changelog for the large 2.1.241-to-2.1.242 transition.
+
+The existing string diff already reports =--no-home-settings= at line 387,
+the TTL descriptions at lines 1509-1510, and the thinking-display retry
+message at line 2136. Dismissing them as Unicode normalization was incorrect.
+
+** High: 2.1.243 misses removal of the LSP opt-in gate
+
+Affected claim: [[file:../archive/claude-code/changelog/changelog-v2.1.243.md::5][summary]]
+and its assertion that no feature gates changed.
+
+Original sources:
+
+#+begin_src js
+// 2.1.242, chunk-rrz1yb6n.js
+function Blr(){return ee.ENABLE_LSP_TOOL}
+
+// 2.1.243, chunk-ez6h7hee.js
+function Blr(){return yo("true")}
+#+end_src
+
+The imported =yo= resolves to a boolean parser in =chunk-0jh7gvkv.js=;
+it accepts ="true"=. Isolated evaluation of the extracted functions returns
+false for 2.1.242 with =ENABLE_LSP_TOOL=false= and true for 2.1.243.
+
+The tool list uses =...Blr() ? [Zxt] : []=, where =Zxt= is the LSP tool.
+Thus the opt-in gate is removed. The tool retains its own =isEnabled()=
+check and plugin/server conditions; this does not mean an LSP server is
+automatically available in every installation.
+
+Readable source references:
+- [[file:../archive/claude-code/pretty/pretty-v2.1.242.js::790698][Old gate]].
+- [[file:../archive/claude-code/pretty/pretty-v2.1.243.js::800913][New gate]].
+- [[file:../archive/claude-code/pretty/pretty-v2.1.243.js::502][Boolean parser]].
+- [[file:../archive/claude-code/pretty/pretty-v2.1.243.js::831416][Tool registration]].
+- [[file:../archive/claude-code/pretty/pretty-v2.1.243.js::978550][LSP tool definition and remaining enabled check]].
+
+This change introduces no distinct string literal: ="true"= already occurs
+elsewhere, and =ENABLE_LSP_TOOL= is an identifier/property access. An unchanged
+string set cannot establish unchanged feature gates or behavior.
+
+** Qualified: 2.1.245 contains an autofix-PR refactor and an additional adapter
+
+The old =chunk-ppwn9nbq.js= contains the autofix implementation and its
+interactive UI. In 2.1.245:
+
+- =chunk-kcay3z98.js= holds the shared implementation.
+- =chunk-m0441ap1.js= holds the interactive UI and imports that implementation.
+- =chunk-k4jjvbvf.js= adds an asynchronous =call= adapter that returns text
+  for success, error or cancellation and uses the caller's abort signal.
+
+The normal =autofix-pr= command dispatch changes its import from the old
+combined module to =chunk-m0441ap1.js=. No reference to the new text adapter
+was found in the archived JavaScript module texts. A compiled or computed
+entry route has not been ruled out; live headless operation was not tested.
+
+Accordingly, the [[file:../archive/claude-code/changelog/changelog-v2.1.245.md][current changelog]]
+can retain a carefully qualified statement that no user-facing change was
+verified. It should not present the string diff or blanket dismissal of
+structural changes as proof that the release has no behavior changes.
+
+** Medium: later notes describe existing foundations as new features
+
+These are spot checks, not a full 2.1.246/2.1.247 review:
+
+- [[file:../archive/claude-code/changelog/changelog-v2.1.246.md::9][2.1.246 scheduled cloud agents]]:
+  the =Schedule Cloud Agents= prompt, scheduling tool, =tengu_surreal_dali=
+  gate and =allow_remote_sessions= checks already exist in 2.1.241 and
+  2.1.245. Changes to scheduling behavior or prompts need to be described
+  as changes to existing infrastructure, not its initial addition.
+- [[file:../archive/claude-code/changelog/changelog-v2.1.246.md::49][2.1.246 memory stores]]:
+  connected memory-store read/write tools and conflict-aware writes already
+  exist in 2.1.241/2.1.245. The newer text distinguishes personal and project
+  stores. A new heading such as =Memory stores available in this session=
+  does not establish that the store feature itself is new.
+- [[file:../archive/claude-code/changelog/changelog-v2.1.247.md::40][2.1.247 spinner tips]]:
+  =spinnerTipsOverride= already supports =tips: string[]= and
+  =excludeDefault= in 2.1.241 through 2.1.246. The richer entries,
+  =tipsFile= and =label= are extensions. The phrase =New spinnerTipsOverride
+  setting= and the broad new-feature description are misleading.
+
+* Process findings
+
+** Follow-up: astdiff matching and filtering damaged the 2.1.243 comparison
+
+The pipeline does use astdiff: =generate_diff= resolves it from =PATH= and
+compares the two pretty JavaScript files. It then passes the result through
+=_filter_astdiff= before giving the filtered artifact to the model.
+
+The raw 2.1.243 diff emits the new =Blr() { return p4("true"); }= as an added
+function. It incorrectly pairs the old =Blr= with the new =Zpr= getter:
+
+#+begin_src diff
+@@@ function 'Zpr' (was 'Blr') — structural (100.0%)
+ function Blr() {
+-  return Hi5.ENABLE_LSP_TOOL;
++  return Hi5.CLAUDE_PROJECT_UUID;
+ }
+#+end_src
+
+Evidence: [[file:../archive/claude-code/diff/v2.1.243.diff::8522][raw getter hunk]]
+and [[file:../archive/claude-code/diff/v2.1.243.diff::3255][new gate addition]].
+The filter then discarded all structural entries scored at =100.0%= as
+"reformatting-only". For this comparison it discarded 1,134 of 2,346
+structural hunks, including the old LSP gate. The archived filtered input
+had no =ENABLE_LSP_TOOL= occurrence. Similarity measures matching evidence;
+it is not a semantic-equivalence result.
+
+The follow-up fix removes this score-based deletion. The actual raw 2.1.243
+diff now retains both the old property access and the new gate when filtered.
+A regression fixture uses the observed mispaired getter and added function.
+This preserves evidence but does not repair astdiff's incorrect pairing.
+Existing filtered archives still require regeneration before a model replay.
+
+On September 11, =PATH= resolved =astdiff= to =~/.cargo/bin/astdiff=, a binary
+dated April 29 reporting =0.2.0=. The separate astdiff checkout has a newer
+September 11 build with a different CLI, while still reporting package version
+=0.2.0=; its =identifier-lineage-v3= worktree has a modified =src/lineage.rs=.
+The sync command records neither an executable hash nor a source revision.
+Do not assume the newer checkout is the production binary or that installing
+its current dirty research build resolves the observed matching defect.
+Compare a pinned build on the archived release pairs first.
+
+** Extraction preserved the evidence; the analysis did not interpret it reliably
+
+For the omissions above, the new code is present in both the original module
+maps and the esbuild analysis snapshots. This review found no extraction loss
+that explains these particular errors. It does not certify the entire binary
+extractor or omitted non-JavaScript assets.
+
+The rebundler sorts every module by its content-hashed filename and exports
+all of them as synthetic roots. Renamed chunks reorder the analysis bundle;
+retaining every root also exposes code that need not be reachable from the
+normal CLI. That snapshot is useful for searching but creates a poor direct
+baseline for declaration matching and feature availability claims.
+
+The 2.1.242 filtered AST diff is 75,511,663 bytes and 2,150,416 lines.
+The prompt demands reading the entire diff and calls added declarations
+=Completely new code=. This is unsuitable for this packaging transition.
+The split-module caution in =tools/sync.py= is justified, but cannot be used
+to dismiss substantive changes along with wrapper churn.
+
+** The string-diff file is not reliably searchable as text
+
+=string-diff-v2.1.242.txt= contains one NUL byte, at byte offset 16.
+Ordinary =rg= reports a binary match and can stop before later evidence.
+=rg -a= finds the TTL and retry entries cited above.
+
+=tools/string_diff.js= escapes newlines but prints other control characters
+literally. It should produce escaped, text-safe output. Its filtering also
+discards short strings/identifiers and its display truncates long entries.
+Even an unfiltered string set lacks occurrence and call-site information.
+
+** Acceptance checks validate document shape, not correctness
+
+=tools/sync.py::_changelog_looks_broken= accepts a body with at least 200
+characters and one second-level heading. Both incorrect no-change summaries
+satisfy this check. Successful generation, posting and pushing establish
+delivery, not source-backed correctness.
+
+The prompt also says an added string verifies a feature addition. New wording,
+new static fragments of a template, a duplicate module, or a new call site
+for existing text do not support that conclusion alone.
+
+* Recommended cleanup
+
+1. Replace the 2.1.242 and 2.1.243 summaries using verified before/after
+   evidence. Complete the remaining 2.1.242 review before calling a replacement
+   comprehensive. Keep the qualified status for 2.1.245 and record its refactor.
+2. Review 2.1.246 onward for features misdated by the packaging changes;
+   distinguish new capabilities, extensions, wording changes and unreachable
+   infrastructure.
+3. Compare original modules using stable candidate matching, then verify import
+   targets, binding relationships, gates and registration. Split large changes
+   into bounded source comparisons. A structural hash is a navigation aid,
+   not a semantic-equivalence test.
+4. Escape control characters in string reports and retain an unfiltered
+   machine-readable representation with source locations. Report property,
+   numeric and boolean changes separately from literal strings.
+5. Require before/after evidence for substantive claims and explicit coverage
+   limits for no-change summaries. Do not certify correctness merely because
+   the generated Markdown meets the formatting heuristic.
+
+* Method and limits
+
+Inputs were the archived 2.1.241 JavaScript monolith, original module maps for
+2.1.242, 2.1.243 and 2.1.245, their prettified analysis snapshots, generated
+diffs and published repository changelog files. Later versions were sampled.
+Registry presence was checked against the live npm package metadata.
+
+The independent comparison parsed the raw sources with Acorn and used
+identifier-insensitive function/token fingerprints to find candidates,
+preserving property names, literal values and operators. Chunk paths and
+known version/build metadata were normalized for that comparison.
+
+- 2.1.242 to 2.1.243: 1,377 of 1,378 module texts match after chunk-path and
+  metadata normalization. The remaining module has symbol renames and the
+  LSP gate change. Exactly one unmatched function shape was found on each side:
+  the gate shown above.
+- 2.1.243 to 2.1.245: 1,377 modules have matching token shapes when
+  non-property identifiers are ignored. The remaining old combined module
+  becomes the three autofix modules described above. The new text adapter is
+  the only unmatched function shape.
+
+These matching counts do not prove preserved binding identities, module
+initialization order, entry-point reachability or whole-program behavior.
+Candidate findings were checked against their original sources and relevant
+call sites. No full Claude executable, cloud launch or model request was run
+for this audit.
+
+The ignored =.sync-temp-changelog-audit/= directory contains comparison
+scripts/results and =verify-findings.js=. The latter evaluates only extracted
+pure gate/TTL functions with controlled dependencies; its assertions passed.
+
+This review added this report. It did not revise or republish changelogs.
+The mcron service was checked and remains running and enabled.

@@ -10,7 +10,6 @@ Usage: python3 seed_tasks.py [version] [task_list_id]
 """
 import json
 import sys
-import uuid
 from pathlib import Path
 
 TASKS_ROOT = Path.home() / ".claude" / "tasks"
@@ -78,7 +77,7 @@ def seed_tasks(version: str, task_list_id: str, batches_dir: Path) -> int:
 
     print(f"Seeded {len(task_ids)} tasks in {task_dir}")
     print(f"Task list ID: {task_list_id}")
-    print(f"\nRun coordinator with:")
+    print("\nRun coordinator with:")
     print(f"  CLAUDE_CODE_TASK_LIST_ID={task_list_id} claude -p '<coordinator-prompt>'")
     return len(task_ids)
 

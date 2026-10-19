@@ -36,7 +36,6 @@ Arguments:
 
 import argparse
 import json
-import os
 import re
 import sys
 from dataclasses import dataclass, field, asdict
@@ -371,7 +370,7 @@ class PromptExtractor:
                     id=f"hook-desc-{line_num}",
                     category='hook',
                     subcategory='description',
-                    name=f"Hook Description",
+                    name="Hook Description",
                     content=content,
                     source_line=line_num
                 ))
@@ -531,11 +530,11 @@ def write_markdown_files(prompts: List[PromptEntry], output_path: Path, version:
     # Write an index file for this version
     index_file = version_dir / "index.md"
     with open(index_file, 'w', encoding='utf-8') as f:
-        f.write(f"---\n")
+        f.write("---\n")
         f.write(f"version: {version}\n")
         f.write(f"extracted_at: {datetime.now().isoformat()}\n")
         f.write(f"total_prompts: {len(prompts)}\n")
-        f.write(f"---\n\n")
+        f.write("---\n\n")
         f.write(f"# Claude Code Prompts - v{version}\n\n")
         f.write(f"Extracted: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
         f.write("## Categories\n\n")

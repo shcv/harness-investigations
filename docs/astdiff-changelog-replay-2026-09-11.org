@@ -1,0 +1,69 @@
+#+TITLE: Purpose-built astdiff changelog replay
+#+DATE: 2026-09-11
+
+* Result
+
+The =../astdiff-changelog= candidate materially improves the diff, but the
+current =gpt-5.6-terra= medium generation stage remains unreliable.
+
+The candidate fixes the audited 2.1.243 matcher defect: the old and new =Blr=
+functions form one gate-change hunk, while the unchanged =Zpr= getter is absent.
+It also extracts generator functions, which restores the 2.1.242
+=thinking.display= retry evidence. Its filtered outputs retain all audited
+anchors for 2.1.242, the LSP gate for 2.1.243, and both autofix findings for
+2.1.245.
+
+The changelog replay was isolated from previous changelogs, audit documents,
+replay reports, and memory by its prompt and archive layout. No output was
+published.
+
+| Version | Generation result |
+|---------+-------------------|
+| 2.1.242 | Finds several substantive cloud/plugin/hook changes, but still misses the audited cache-TTL controls, hidden =--no-home-settings= flag, and thinking-display retry. |
+| 2.1.243 | One run correctly reports removal of the LSP opt-in gate; a second run on identical evidence incorrectly reports no change. |
+| 2.1.245 | Correctly avoids claiming a new user-facing autofix feature, but dismisses the verified implementation split and new adapter as wrapper churn. |
+
+The two 2.1.243 results are direct evidence of generation variance. Both runs
+read the corrected diff and neither read the previous changelog. The successful
+run is retained as
+[[file:../.sync-temp-astdiff-changelog-replay-20260911/changelog-v2.1.243-correct-run.md][the correct 2.1.243 result]]; the later no-change result is
+[[file:../.sync-temp-astdiff-changelog-replay-20260911/archive/claude-code/changelog/changelog-v2.1.243.md][the failed repeat]].
+
+* Candidate and verification
+
+Source worktree: =../astdiff-changelog=, branch =changelog-diff-quality=, based
+on clean master =239893cea43682c12ba4745c198ebe6fde412328=. The worktree is
+intentionally dirty. The tracked implementation diff hash is
+=2d340ca5ca5209d67cfc0777315186cfdb2cf93e002e494ed98cf56e4d46ed20=.
+
+Installed binary:
+=~/.local/lib/harness-investigations/astdiff/239893c-changelog-2d340ca5ca52/astdiff=.
+SHA-256:
+=0561eb84caff62fbe2a3ec5457744825cfcc5ce8d9a8ca5a6bd7e1c448a3fecf=.
+The adjacent manifest records the provenance and checks. The service's local
+=CHANGELOG_ASTDIFF_BIN= selects this exact artifact.
+
+=tools/check.sh= passed formatting, clippy with warnings denied, 89 Rust tests,
+documentation with warnings denied, shell checks, and diff checks. A locked
+release build passed. The candidate's own current replay then passed all
+assertions on the current archive and consumer:
+
+- 2.1.242: both TTL settings and environment controls, =--no-home-settings=,
+  and =tengu_thinking_display_rejected_retry= appear as added evidence.
+- 2.1.243: exactly one old-to-new =Blr= gate hunk; no reported =Zpr= change.
+- 2.1.245: the added text adapter and implementation/module split are reported.
+
+The replay metadata and full diffs are under
+=../astdiff-changelog/target/changelog-review/requested-replay-20260911/=.
+The isolated generation artifacts are under
+=.sync-temp-astdiff-changelog-replay-20260911/=. Session logs captured all
+commands and tool results.
+
+* Conclusion
+
+This candidate is a real diff improvement and is now the service-selected
+binary. It does not make prose generation dependable by itself. The next gate
+should verify required evidence coverage and reject a no-change conclusion
+when the filtered diff contains substantive old-to-new changes. Model strength
+can then be evaluated against a fixed evidence set rather than used as the
+only correctness mechanism.

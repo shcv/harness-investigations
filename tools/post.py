@@ -8,7 +8,6 @@ Tracks the last posted version to enable automatic posting of new changelogs.
 
 import argparse
 import json
-import os
 import re
 import sys
 import time
@@ -320,9 +319,12 @@ def save_upload_state(project_root: Path, state: dict, project_name: Optional[st
     else:
         state_file = project_root / UPLOAD_STATE_FILE
     try:
-        state_file.write_text(json.dumps(state, indent=2) + "\n")
+        temporary = state_file.with_suffix('.tmp')
+        temporary.write_text(json.dumps(state, indent=2) + "\n")
+        temporary.replace(state_file)
     except Exception as e:
         print_error(f"Could not save upload state: {e}")
+        raise
 
 
 def get_version_state(state: dict, version_str: str) -> Optional[dict]:
@@ -465,6 +467,27 @@ def save_last_posted_version(project_root: Path, ver: version.Version, project_n
     else:
         last_posted_file = project_root / LAST_POSTED_FILE
     last_posted_file.write_text(str(ver) + "\n")
+
+
+TRAILER_START_RE = re.compile(r'^Generated (?:by `harness-investigations@|with:$)')
+
+
+def subtext_trailer(content: str) -> str:
+    """Render the generation trailer as Discord subtext (``-# `` lines).
+
+    The trailer is metadata, so it should not compete with the changelog
+    body. The archived Markdown keeps plain lines; only the posted copy
+    changes.
+    """
+    lines = content.rstrip('\n').split('\n')
+    start = next((i for i in range(len(lines) - 1, -1, -1)
+                  if TRAILER_START_RE.match(lines[i])), None)
+    if start is None:
+        return content
+    for i in range(start, len(lines)):
+        if lines[i].strip():
+            lines[i] = '-# ' + lines[i]
+    return '\n'.join(lines) + '\n'
 
 
 def parse_changelog_sections(content: str) -> List[Tuple[str, str]]:
@@ -734,7 +757,7 @@ def post_to_discord(
             response = requests.post(
                 f"{webhook_url}?wait=true",
                 json=first_payload,
-                headers={"Content-Type": "application/json"}
+                headers={"Content-Type": "application/json"}, timeout=30,
             )
             response.raise_for_status()
 
@@ -760,7 +783,7 @@ def post_to_discord(
             chunk_response = requests.post(
                 f"{webhook_url}?thread_id={thread_id}",
                 json=chunk_payload,
-                headers={"Content-Type": "application/json"}
+                headers={"Content-Type": "application/json"}, timeout=30,
             )
             chunk_response.raise_for_status()
 
@@ -788,7 +811,8 @@ def post_changelog(
     webhook_url: str,
     dry_run: bool = False,
     project_name: Optional[str] = None,
-    post_history: Optional[dict] = None
+    post_history: Optional[dict] = None,
+    channel_name: Optional[str] = None,
 ) -> bool:
     """
     Post a single changelog file to Discord, resuming if partially uploaded.
@@ -803,21 +827,25 @@ def post_changelog(
         return False
 
     thread_name = f"v{ver_str}"
+    state_key = f'{channel_name}:{ver_str}' if channel_name else ver_str
+    if upload_state.get(state_key, {}).get('complete'):
+        print_info(f"Already delivered {thread_name} to {project_name}")
+        return True
 
     # Deduplication check: skip if recently posted to this webhook
     if post_history is not None and project_name and not dry_run:
-        if was_recently_posted(post_history, project_name, ver_str):
+        if was_recently_posted(post_history, project_name, state_key):
             print_warning(f"Skipping {thread_name} - already posted to {project_name} within {DEDUP_WINDOW_SECONDS}s")
             return True  # Return True to not break the posting loop
 
     try:
-        content = file_path.read_text()
+        content = subtext_trailer(file_path.read_text())
     except Exception as e:
         print_error(f"Could not read {file_path}: {e}")
         return False
 
     # Check if we're resuming a partial upload
-    version_state = get_version_state(upload_state, ver_str)
+    version_state = get_version_state(upload_state, state_key)
     resume_thread_id = None
     resume_from_chunk = 0
 
@@ -838,7 +866,7 @@ def post_changelog(
         thread_name,
         content,
         rate_limiter,
-        ver_str,
+        state_key,
         upload_state,
         project_root,
         webhook_url,
@@ -848,17 +876,18 @@ def post_changelog(
         project_name
     )
 
-    if success:
-        # Mark as complete and remove from state
-        mark_version_complete(upload_state, ver_str)
+    if success and not dry_run:
+        # Retain a durable receipt so a later scheduler retry does not create
+        # duplicate threads after the short deduplication window expires.
+        upload_state[state_key] = {'complete': True, 'thread_id': thread_id}
         save_upload_state(project_root, upload_state, project_name)
         print_success(f"Posted {thread_name} ({chunks_posted} chunks)")
 
         # Record in post history for deduplication
         if post_history is not None and project_name and not dry_run:
-            record_post(post_history, project_name, ver_str)
+            record_post(post_history, project_name, state_key)
             save_post_history(project_root, post_history)
-    else:
+    elif not success:
         print_error(f"Failed to complete {thread_name} (posted {chunks_posted} chunks)")
 
     return success
@@ -1082,6 +1111,18 @@ Examples:
         print_error("No channels configured")
         return 1
 
+    # Seed per-webhook cursors together before any delivery advances the legacy
+    # shared channel cursor. A failure on one subscriber must not skip its work
+    # because another subscriber already received a newer version.
+    if not args.dry_run and (args.all or args.new or args.versions):
+        for webhook in all_webhook_configs:
+            state = load_upload_state(project_root, webhook.name)
+            cursors = state.setdefault('_channel_cursors', {})
+            for channel_name in webhook.channels:
+                if channel_name in channels:
+                    cursors.setdefault(channel_name, channels[channel_name].last_posted_version)
+            save_upload_state(project_root, state, webhook.name)
+
     # Validate Discord webhook URLs are set
     missing_webhooks = []
     for wh in webhook_configs:
@@ -1190,7 +1231,8 @@ Examples:
             # Determine changelogs for this channel
             if args.new:
                 # Filter based on last posted version for this channel
-                last_posted_str = channel.last_posted_version
+                last_posted_str = upload_state.get('_channel_cursors', {}).get(
+                    channel_name, channel.last_posted_version)
                 if last_posted_str is None:
                     print_info(f"No last posted version for {channel_name}, will post all (within range)")
                     channel_changelogs = base_changelogs
@@ -1231,7 +1273,8 @@ Examples:
                     webhook_url,
                     dry_run=args.dry_run,
                     project_name=webhook.name,
-                    post_history=post_history
+                    post_history=post_history,
+                    channel_name=channel_name,
                 ):
                     posted_count += 1
                     total_posted += 1
@@ -1243,7 +1286,15 @@ Examples:
 
             # Update last posted version for this channel
             if last_posted_ver and not args.dry_run:
-                save_channel_version(channel_name, str(last_posted_ver))
+                cursors = upload_state.setdefault('_channel_cursors', {})
+                prior = cursors.get(channel_name)
+                if prior:
+                    last_posted_ver = max(last_posted_ver, version.parse(prior))
+                cursors[channel_name] = str(last_posted_ver)
+                save_upload_state(project_root, upload_state, webhook.name)
+                legacy = channel.last_posted_version
+                save_channel_version(channel_name, str(max(
+                    last_posted_ver, version.parse(legacy)) if legacy else last_posted_ver))
                 print_success(f"Updated last posted version for {channel_name} to v{last_posted_ver}")
 
             if posted_count > 0:

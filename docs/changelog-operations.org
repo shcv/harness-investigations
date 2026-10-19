@@ -1,0 +1,263 @@
+#+TITLE: Changelog Operations
+
+* Service authority
+
+On Termini, Guix Home's =mcron= schedules
+=~/.local/bin/ai-cli-changelog-sync= every five minutes. The declaration is in
+=~/config/common/guix/home-configuration.scm=. The executable is a symlink to
+=~/config/common/local-scripts/.local/bin/ai-cli-changelog-sync=; changes to
+that script take effect on the next invocation without a Home reconfigure.
+
+The wrapper sources this checkout's =.env=, then runs =claude-code= and =codex=
+sequentially with =--all --git-commit=. Current production settings are Codex,
+=gpt-6.1-sol= at medium reasoning for changelogs and =gpt-6-luna= at low
+reasoning for annotation. The local executable pin is
+=/home/shcv/.local/bin/codex=; the previous =~/.bun/bin/codex= no longer exists.
+Annotation is opt-in with =--annotate= or =CHANGELOG_ANNOTATE=true= in =.env=;
+=--no-annotate= overrides either configuration. The default timeout is 30 minutes per
+project, followed by TERM and a five-minute grace period before KILL.
+=AI_CLI_CHANGELOG_PROJECT_TIMEOUT= overrides it. A failed project does not
+prevent the next project from running.
+
+Scheduled failures are logged on every run. The wrapper records consecutive
+failed runs per project in
+=~/.local/state/ai-cli-changelog-sync/failures.json=. It exits successfully
+while a failure is younger than 15 minutes. When it persists, the wrapper asks
+=codex exec= with =gpt-6-sol= to analyze a bounded excerpt of that project's
+failed run in read-only mode (45-second limit), then exits nonzero and sends one
+desktop notification with a brief explanation. If Codex is unavailable or times
+out, the notification still goes out with a plain fallback. Each later failed
+run remains nonzero; the next successful run logs recovery and clears that project's
+failure record. =AI_CLI_CHANGELOG_FAILURE_GRACE_SECONDS= overrides the default
+900 seconds. The grace period applies only to the scheduled wrapper: direct
+=tools/sync.py= runs still fail and notify immediately. If the state file is
+unreadable or invalid, the wrapper fails instead of losing the failure history.
+
+The wrapper uses a persistent =flock= inode at
+=/tmp/ai-cli-changelog-sync.lock=. Do not delete that file to clear a lock:
+the lock belongs to open descriptors, not the PID text. Overlapping scheduled
+slots exit successfully without starting another run. Manual invocations of
+=tools/sync.py= do not take this wrapper lock; stop scheduling and verify no
+wrapper is running before operating on the same archive manually.
+
+#+begin_src bash
+herd status mcron
+herd schedule mcron
+herd stop mcron
+herd start mcron
+tail -f ~/.local/var/log/ai-cli-changelog-sync.log
+#+end_src
+
+=mcron= also schedules =claude-session-archive=. Stopping or starting it affects
+both jobs. The scheduler's own output is in
+=~/.local/state/shepherd/mcron.log=. The wrapper log includes Python output as
+well as per-project elapsed times and exit statuses.
+
+* Agent session logs
+
+Every provider invocation saves a private directory under =.agent-logs/= in
+this checkout. =CHANGELOG_AGENT_LOG_DIR= overrides the location. The wrapper
+log prints the directory for each invocation. =metadata.json= records the
+provider, requested/resolved model when available, reasoning effort, working
+directory, tool policy, timestamps and outcome. =request.json= holds the
+input prompts; =final.txt= holds a successful answer and =error.txt= records
+failures.
+
+=events.jsonl= contains Codex's native =exec --json= events, Claude SDK
+messages (including tool-use and tool-result blocks), or Qwen responses and
+tool results. Codex also retains =stderr.log=, the composed =prompt.txt=,
+=command.json= and =last-message.txt=. Its event stream goes directly to disk,
+so partial events survive a timeout or process termination. These are the
+events exposed by each provider, not a promise of access to internal model
+state. Codex remains ephemeral outside this bounded log directory.
+
+Only the five most recently started finished/abandoned runs are retained
+across providers. Active runs are temporarily additional and protected by
+kernel locks. Retention runs when a session starts and finishes; a killed
+run becomes eligible on the next invocation. Environment variables and API
+credentials are not copied into the logs. Prompts and tool output are
+retained, so directories are private to the current user and Git-ignored.
+
+* Source and output boundaries
+
+The annotation pre-pass and standalone =annotate_changes.py= share one
+provider adapter, prompt, response validator, and cache implementation. Codex
+batches run serially with a five-minute timeout each. Claude and Qwen batches
+use up to four independent runners. Each completed batch records hashes of
+its full input and prompt along with the provider, requested model, reasoning
+effort and transport settings. Legacy, invalid, or mismatched caches are
+regenerated. JSON is validated before an atomic cache write; a failed batch
+blocks prose generation without discarding other successful batches.
+
+The integrated pipeline rebuilds batches from the selected diff, including the
+selected redo iteration, and removes obsolete batch files. It supports AST
+change blocks and Git unified diff hunks. Batch content is capped at 60,000
+characters; oversized blocks are split into labeled excerpts without dropping
+source content. Rerun the slicer when using older standalone batch directories.
+Only annotations with importance at
+least two enter the summary. A valid empty annotation result permits direct
+diff-based prose; a provider failure does not. Changelog provenance names the
+requested annotation model when its summary is used.
+
+Claude Code originally embedded one CommonJS wrapper. From the observed
+=2.1.242= distribution, it embeds a graph of ES modules. =bun_extract.py=
+reads the ELF section and Bun module table without executing the binary.
+The original JavaScript module text is retained in
+=original/cli-vVERSION.modules.json=. =rebundle_bun.js= combines all modules,
+including worker modules, into a single analysis snapshot using the locked
+esbuild dependency. Tree shaking and annotation-based removal are disabled.
+This normalization still changes names, wrappers, order, and some syntax;
+the combined file is an analysis artifact, not an exact executable copy.
+Native assets and bytecode are outside the JavaScript changelog's coverage.
+
+The first comparison across the packaging change has substantial structural
+noise. Generation prompts identify this boundary and point to the original
+module text. A syntactically valid diff does not establish that every generated
+feature claim is correct; inspect representative changelogs and their evidence.
+
+The Claude pipeline runs =astdiff= on consecutive, consistently normalized
+analysis inputs, then filters its output before generation. Legacy bundles use
+Prettier output; split-module bundles use esbuild snapshots on both sides of a
+comparison. Matching similarity is not semantic equivalence: preserve
+structural hunks even when their score is =100.0%=.
+The filter only removes known version/build metadata changes and groups import
+pairs. Cached filtered files created by the older filter must be rebuilt from
+their raw diffs before replaying an affected changelog.
+
+For split-module Bun releases, the esbuild output is already a parsed,
+deterministic analysis snapshot. The =pretty/= entry is a hard link retained
+for readers that use the established archive path; =astdiff= reads the original
+esbuild snapshots directly, without a second whole-file Prettier parse or
+another copy on disk. Diff discovery starts from the expected version sequence;
+a missing analysis input blocks and identifies the affected version instead of
+making downstream phases report that all output exists.
+
+Artifact discovery and release-note discovery have separate authorities.
+Claude Code artifacts come from npm, while its published baseline comes from
+the =anthropics/claude-code= GitHub release tagged =vVERSION=. The generator
+writes those notes to =changes/release-notes-vVERSION.md= and requires the
+agent to read them before the custom diff, and to cover every published item
+within the normal section order. GitHub-sourced projects inherit
+their source repository and tag prefix as the release-note defaults.
+
+** Pinned astdiff build
+
+=--astdiff-bin= overrides =CHANGELOG_ASTDIFF_BIN=, which otherwise defaults to
+=astdiff= on =PATH=. An unavailable required executable fails the diff step;
+it does not fall back to a textual comparison. Changelog generation likewise
+refuses to run for an astdiff project without filtered astdiff output (the
+filter is rerun first when its output is missing or older than the diff);
+=--allow-degraded-diff= overrides this. The changelog trailer's =Inputs:= line
+records which inputs a run actually used. Each generated AST diff has a
+=vVERSION.meta.json= sidecar with the executable path/hash, both input
+paths/hashes, thread setting, and output path/hash.
+
+The first September 11 retry used clean astdiff master revision
+=239893cea43682c12ba4745c198ebe6fde412328= plus
+[[file:../tools/patches/astdiff-239893c-grammar025.patch][the JavaScript grammar compatibility patch]]. It has been superseded by the
+purpose-built =../astdiff-changelog= candidate described below.
+Unpatched master rejects =using= declarations in these archives. The patch
+upgrades tree-sitter and its JavaScript grammar to 0.25, preserves resource
+binding scopes and top-level resource declarations, updates the grammar
+identity, and adds parsing/comparison regressions. Parse errors remain fatal.
+The grammar's [[https://github.com/tree-sitter/tree-sitter-javascript/blob/v0.25.0/grammar.js][using declarations]] and
+[[https://github.com/tree-sitter/tree-sitter-javascript/blob/v0.25.0/bindings/rust/lib.rs][Rust binding API]] are the upstream references.
+
+The service's local =.env= points to
+=~/.local/lib/harness-investigations/astdiff/239893c-changelog-2d340ca5ca52/astdiff=.
+The adjacent =manifest.json= records its base revision, tracked source-diff
+hash, executable hash, build and validation. This current binary is built from
+the dirty =changelog-diff-quality= worktree at master =239893c=. Its tracked
+source diff hash is
+=2d340ca5ca5209d67cfc0777315186cfdb2cf93e002e494ed98cf56e4d46ed20=;
+its executable hash is
+=0561eb84caff62fbe2a3ec5457744825cfcc5ce8d9a8ca5a6bd7e1c448a3fecf=.
+The worktree's full gate passed with 89 tests. A current archive replay passed
+all explicit checks for 2.1.242, 2.1.243 and 2.1.245. See
+[[file:astdiff-changelog-replay-2026-09-11.org][the candidate replay report]].
+The unrelated =identifier-lineage-v3= research checkout was not modified.
+
+Replay outputs are separate from the publishing archive, under
+=.sync-temp-astdiff-replay-20260911/=. Its =replay.py= invokes the same diff,
+filter and generation methods with =gpt-5.6-terra= at medium reasoning,
+annotation disabled and four astdiff threads. It preserves the existing
+system prompt and records a session-log path for each generation.
+The later controlled generation replay, which excludes previous answers, is
+under =.sync-temp-astdiff-changelog-replay-20260911/=.
+The Sol/Astra comparison and the corrected 2.1.170 audit are in
+[[file:changelog-model-replay-2026-09-13.org][the model replay report]].
+
+Bun layout reference:
+[[https://github.com/oven-sh/bun/blob/main/src/standalone_graph/StandaloneModuleGraph.rs][StandaloneModuleGraph]]. Bundler options:
+[[https://esbuild.github.io/api/#tree-shaking][esbuild tree shaking]] and [[https://esbuild.github.io/api/#ignore-annotations][annotation handling]].
+
+Codex versions come from synchronized local numeric stable tags. Significant
+tags qualify at five changed files or 100 changed lines. Smaller tags qualify
+when GitHub reports a published release. Release lookups are per tag, cached
+locally for one hour; there is no unbounded release-history pagination.
+A 404 labels a generated snapshot as unreleased. Transient lookup failures
+leave publication status unknown rather than asserting that a release is absent.
+
+* Failure recovery and publication
+
+Generation writes to =changelog/.drafts/=. Validation examines the model's
+body before provenance is appended. Only validated, cleaned content is renamed
+to =changelog-vVERSION.md=. Rejected or interrupted drafts do not satisfy
+completion checks and cannot be picked up by the posting glob.
+
+When automatic publishing is enabled, =archive/PROJECT/.delivery/= records
+pending Git and Discord steps. A later scheduled invocation resumes unfinished
+delivery without regenerating accepted output. Successful Git commits touch
+only the selected changelog path, preserve unrelated staged work, and use
+=commit-msg= with an =Assisted-by:= trailer. A failed commit retains that file.
+Failed pushes are retried even if the changelog is already committed.
+The locally configured HTTPS fallback uses the existing GitHub credential
+helper; it is explicitly enabled through =CHANGELOG_GIT_HTTPS_FALLBACK=.
+
+Discord upload state has per-webhook channel cursors and durable per-channel
+version receipts. An unavailable subscriber does not lose its position when
+another subscriber succeeds. Partial uploads resume in their existing thread.
+Do not remove =.upload_state_*.json= to retry a failed delivery. An ambiguous
+HTTP timeout after Discord accepted a message still requires checking the
+remote thread before resending; local receipts cannot resolve that ambiguity.
+
+=--dry-run= prevents external publication and preserves delivery state. It
+does perform local pipeline work, including model calls. For a local-only
+generation check, use explicit phase flags and omit =--post= and =--git-commit=.
+
+* Validation
+
+#+begin_src bash
+npm ci
+python3 -m unittest discover -s tests -v
+python3 -m py_compile tools/*.py
+bash -n ~/.local/bin/ai-cli-changelog-sync
+git diff --check
+#+end_src
+
+The regression suite uses synthetic module graphs, mocked network responses,
+and temporary Git repositories. It checks rejected-output recovery, optional
+metadata failures, small published releases, scoped commits, resumable
+delivery, read boundaries, and dry-run state preservation. It does not prove
+authentication, Discord delivery, upstream format compatibility, or scheduler
+liveness. Check those separately after changes to the corresponding path.
+
+** Model handoff check, 2026-10-04
+
+Codex CLI =0.160.0= was authenticated through its normal ChatGPT login. A
+local synthetic CLI fixture completed both stages: =gpt-6-luna= low produced
+validated annotations, then =gpt-6.1-sol= medium read the fixture diff and
+wrote a validated changelog. The generated file records both model roles.
+The check and private transcripts are under
+=.sync-temp-model-check-20261004/=. It did not publish anything or exercise a
+full release or scheduled run.
+
+All 61 offline tests passed, including model handoff, cache invalidation,
+partial failure recovery, atomic writes, selected redo inputs, and lossless
+splitting of oversized batches. Python compilation and whitespace checks passed.
+
+A local sizing check of Claude Code =2.1.287= yields 2,615 bounded batches;
+Codex =0.160.0= yields 92. The largest batch in either check is below 60,000
+characters. These are input counts, not completed model runs. The Claude Code
+pre-pass can take much longer than a scheduled project's 30-minute limit;
+completed batch caches permit later runs to resume. Annotation remains opt-in.

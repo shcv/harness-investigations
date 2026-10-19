@@ -1,0 +1,240 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 782a330..4e2c6ae 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -136,13 +136,14 @@ checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+ 
+ [[package]]
+ name = "cc"
+-version = "1.0.106"
++version = "1.4.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "066fce287b1d4eafef758e89e09d724a24808a9196fe9756b8ca90e86d0719a2"
++checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
+ dependencies = [
++ "find-msvc-tools",
+  "jobserver",
+  "libc",
+- "once_cell",
++ "shlex",
+ ]
+ 
+ [[package]]
+@@ -304,6 +305,12 @@ version = "2.4.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+ 
++[[package]]
++name = "find-msvc-tools"
++version = "0.1.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
++
+ [[package]]
+ name = "foldhash"
+ version = "0.1.5"
+@@ -695,6 +702,7 @@ version = "1.0.149"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+ dependencies = [
++ "indexmap",
+  "itoa",
+  "memchr",
+  "serde",
+@@ -726,6 +734,12 @@ dependencies = [
+  "digest",
+ ]
+ 
++[[package]]
++name = "shlex"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
++
+ [[package]]
+ name = "similar"
+ version = "2.7.0"
+@@ -738,6 +752,12 @@ version = "0.4.12"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+ 
++[[package]]
++name = "streaming-iterator"
++version = "0.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
++
+ [[package]]
+ name = "strsim"
+ version = "0.11.1"
+@@ -790,24 +810,34 @@ dependencies = [
+ 
+ [[package]]
+ name = "tree-sitter"
+-version = "0.20.10"
++version = "0.25.10"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e747b1f9b7b931ed39a548c1fae149101497de3c1fc8d9e18c62c1a66c683d3d"
++checksum = "78f873475d258561b06f1c595d93308a7ed124d9977cb26b148c2084a4a3cc87"
+ dependencies = [
+  "cc",
+  "regex",
++ "regex-syntax",
++ "serde_json",
++ "streaming-iterator",
++ "tree-sitter-language",
+ ]
+ 
+ [[package]]
+ name = "tree-sitter-javascript"
+-version = "0.20.4"
++version = "0.25.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d015c02ea98b62c806f7329ff71c383286dfc3a7a7da0cc484f6e42922f73c2c"
++checksum = "68204f2abc0627a90bdf06e605f5c470aa26fdcb2081ea553a04bdad756693f5"
+ dependencies = [
+  "cc",
+- "tree-sitter",
++ "tree-sitter-language",
+ ]
+ 
++[[package]]
++name = "tree-sitter-language"
++version = "0.1.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ca0d1bf6fdd806e43ae5198f82f527056d359def39e54e67a0f478ac09dac081"
++
+ [[package]]
+ name = "typenum"
+ version = "1.20.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index be17434..6b2dc32 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,8 +16,8 @@ name = "astdiff"
+ path = "src/main.rs"
+ 
+ [dependencies]
+-tree-sitter = "0.20"
+-tree-sitter-javascript = "0.20"
++tree-sitter = "0.25"
++tree-sitter-javascript = "0.25"
+ clap = { version = "4.5", features = ["derive"] }
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+diff --git a/src/analysis/mod.rs b/src/analysis/mod.rs
+index 8deaf6c..813548e 100644
+--- a/src/analysis/mod.rs
++++ b/src/analysis/mod.rs
+@@ -24,7 +24,7 @@ pub const ANALYSIS_PROFILE: &str = "astdiff.analysis.v1";
+ /// Parser identity pinned by this adapter.
+ pub const JAVASCRIPT_FRONTEND: &str = "tree-sitter-javascript";
+ /// Grammar crate version pinned in `Cargo.lock`.
+-pub const JAVASCRIPT_FRONTEND_VERSION: &str = "0.20.4";
++pub const JAVASCRIPT_FRONTEND_VERSION: &str = "0.25.0";
+ 
+ /// A deterministic 256-bit identity, kept distinct from row indexes and names.
+ #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+diff --git a/src/diff/mod.rs b/src/diff/mod.rs
+index e0c5bdc..7b26aa8 100644
+--- a/src/diff/mod.rs
++++ b/src/diff/mod.rs
+@@ -426,7 +426,7 @@ impl StructuralDiff {
+                     ));
+                 }
+             }
+-            "variable_declaration" | "lexical_declaration" if is_global => {
++            "variable_declaration" | "lexical_declaration" | "using_declaration" if is_global => {
+                 for child in node.children(&mut node.walk()) {
+                     if child.kind() == "variable_declarator" {
+                         if child.child_by_field_name("value").is_none() {
+@@ -670,7 +670,7 @@ impl StructuralDiff {
+                         .filter(|n| n.kind() == "pair")
+                         .count()
+                 ),
+-                "arrow_function" | "function" => {
++                "arrow_function" | "function_expression" => {
+                     let param_count = if let Some(params) = init.child_by_field_name("parameters") {
+                         params.children(&mut params.walk()).count()
+                     } else if init.child_by_field_name("parameter").is_some() {
+diff --git a/src/parser/mod.rs b/src/parser/mod.rs
+index 7ffb765..de4d72d 100644
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -7,9 +7,9 @@ pub struct JsParser {
+ 
+ impl JsParser {
+     pub fn new() -> Result<Self> {
+-        let language = tree_sitter_javascript::language();
++        let language = tree_sitter_javascript::LANGUAGE.into();
+         let mut parser = Parser::new();
+-        parser.set_language(language)?;
++        parser.set_language(&language)?;
+ 
+         Ok(Self { parser })
+     }
+@@ -68,4 +68,16 @@ mod tests {
+         let error = parser.parse("function broken( {").unwrap_err();
+         assert!(error.to_string().contains("syntax error"));
+     }
++
++    #[test]
++    fn parses_explicit_resource_management() {
++        let mut parser = JsParser::new().unwrap();
++        for source in [
++            "function stringify(value) { using timer = measure`JSON.stringify`; return JSON.stringify(value); }",
++            "async function read() { await using resource = open(); return resource.value; }",
++        ] {
++            let tree = parser.parse(source).unwrap();
++            assert!(tree.root_node().to_sexp().contains("using_declaration"));
++        }
++    }
+ }
+diff --git a/src/scope/mod.rs b/src/scope/mod.rs
+index 20ff273..605d410 100644
+--- a/src/scope/mod.rs
++++ b/src/scope/mod.rs
+@@ -91,7 +91,7 @@ impl ScopeAnalyzer {
+         let original_scope = self.current_scope_id.clone();
+ 
+         match node.kind() {
+-            "variable_declaration" | "lexical_declaration" => {
++            "variable_declaration" | "lexical_declaration" | "using_declaration" => {
+                 self.handle_variable_declaration(node, source)?;
+             }
+             "function_declaration" => {
+@@ -400,6 +400,9 @@ impl ScopeAnalyzer {
+     fn handle_variable_declaration(&mut self, node: Node, source: &str) -> Result<()> {
+         let kind = match node.kind() {
+             "variable_declaration" => VariableKind::Var,
++            // Resource bindings are immutable and scoped like const. Their
++            // disposal syntax remains observable in the comparison tokens.
++            "using_declaration" => VariableKind::Const,
+             "lexical_declaration" => {
+                 // Check first token to determine let vs const
+                 if let Some(first_child) = node.child(0) {
+diff --git a/tests/correctness.rs b/tests/correctness.rs
+index 9fccbea..d668a91 100644
+--- a/tests/correctness.rs
++++ b/tests/correctness.rs
+@@ -12,6 +12,20 @@ fn compare(old: &str, new: &str) -> DiffResult {
+     diff.compare_declarations(&left, &right, old, new).unwrap()
+ }
+ 
++#[test]
++fn resource_bindings_normalize_renames_but_preserve_disposal_and_initializer_changes() {
++    let old = "function read(){using resource=open();return resource.value}";
++    let renamed = "function read(){using renamed=open();return renamed.value}";
++    assert!(compare(old, renamed).identical);
++    for new in [
++        "function read(){const resource=open();return resource.value}",
++        "function read(){using resource=openOther();return resource.value}",
++    ] {
++        assert!(!compare(old, new).identical);
++    }
++    assert!(!compare("using resource=open();", "using resource=openOther();").identical);
++}
++
+ #[test]
+ fn one_line_bundle_uses_declaration_byte_ranges() {
+     let result = compare(

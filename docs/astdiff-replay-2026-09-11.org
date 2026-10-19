@@ -1,0 +1,131 @@
+#+TITLE: astdiff upgrade and Claude Code changelog replay
+#+DATE: 2026-09-11
+
+#+begin_quote
+This report covers the first upgraded build. It has been superseded for service
+configuration and matcher evaluation by
+[[file:astdiff-changelog-replay-2026-09-11.org][the purpose-built astdiff-changelog replay]]. Its negative model result remains
+useful as the anchored baseline.
+#+end_quote
+
+* Result
+
+The service now uses a pinned newer astdiff build, but the replay did not
+improve changelog correctness. The 2.1.242 and 2.1.243 outputs repeat the
+incorrect no-substantive-change conclusions. The 2.1.245 output retains its
+qualified no-verified-user-facing-change conclusion and still omits the
+autofix refactor described in the [[file:claude-code-changelog-audit-2026-09-10.org][source audit]].
+
+| Version | Previously verified evidence | Replay outcome |
+|---------+------------------------------+----------------|
+| 2.1.242 | Prompt-cache TTL controls, hidden --no-home-settings, thinking.display retry | All still omitted |
+| 2.1.243 | ENABLE_LSP_TOOL opt-in gate removed | Still incorrectly says no feature gates changed |
+| 2.1.245 | Autofix implementation/UI split and an additional text-returning adapter; CLI route unverified | Still treats structural changes as rebundling noise |
+
+The three replay outputs are deliberately outside the publication archive:
+
+- [[file:../.sync-temp-astdiff-replay-20260911/changelog/changelog-v2.1.242.md][2.1.242 retry]].
+- [[file:../.sync-temp-astdiff-replay-20260911/changelog/changelog-v2.1.243.md][2.1.243 retry]].
+- [[file:../.sync-temp-astdiff-replay-20260911/changelog/changelog-v2.1.245.md][2.1.245 retry]].
+
+* Build and integration
+
+Base revision: =239893cea43682c12ba4745c198ebe6fde412328=, clean astdiff master.
+The unrelated =identifier-lineage-v3= checkout was not modified.
+
+Unpatched master failed on the archived 2.1.242 source at line 33424:
+=using i114 = m13`JSON.stringify(${e61})`;=. Its tree-sitter-javascript 0.20
+grammar could not parse this syntax. The [[file:../tools/patches/astdiff-239893c-grammar025.patch][retained compatibility patch]] upgrades
+tree-sitter to 0.25.10 and the JavaScript grammar to 0.25.0, updates the parser
+API and grammar identity, handles resource bindings, and adds regression
+coverage. Parser errors still fail the operation. Upstream references:
+[[https://github.com/tree-sitter/tree-sitter-javascript/blob/v0.25.0/grammar.js][grammar]] and [[https://github.com/tree-sitter/tree-sitter-javascript/blob/v0.25.0/bindings/rust/lib.rs][Rust bindings]].
+
+Installed executable:
+=~/.local/lib/harness-investigations/astdiff/239893c-js025-964c6335cc0e/astdiff=.
+The local =CHANGELOG_ASTDIFF_BIN= setting selects it for scheduled runs.
+Its adjacent =manifest.json= records revision, patch, build and validation.
+
+- Executable SHA-256:
+  =96ff246b73597d31dd1328be342b868bc9da81c57a2e53f4b3b5ea9f485efaa7=.
+- Patch SHA-256:
+  =964c6335cc0e1091076f0e89a7cd9adcb007805d214baf9d02ae144decc3f6bb=.
+- =tools/check.sh= passed: 82 tests, format, clippy, documentation and shell
+  checks. The locked release build passed.
+- The pipeline's 32 offline tests passed, including executable selection,
+  input/executable hash recording, missing-executable failure, and preservation
+  of changes with a 100% matching score.
+- All three real archive comparisons passed, taking approximately 28-29 seconds
+  each with four astdiff threads. This establishes archive compatibility beyond
+  the small test fixtures that initially missed the grammar issue.
+
+Each new diff has a =.meta.json= sidecar recording the binary and both source
+hashes. A required astdiff executable that is missing no longer triggers a
+fallback to plain text diff.
+
+* Diff comparison
+
+Sizes below are decimal MB. The old filtered artifacts used the faulty
+100%-similarity suppression; the new filtered artifacts preserve those hunks.
+
+| Version | Old raw MB | New raw MB | Old filtered MB | New filtered MB |
+|---------+------------+------------+-----------------+-----------------|
+| 2.1.242 |      76.75 |      82.02 |           75.51 |           82.02 |
+| 2.1.243 |       4.27 |      20.83 |            3.70 |           20.80 |
+| 2.1.245 |       5.47 |      22.54 |            4.54 |           22.49 |
+
+For 2.1.243, unmatched additions/removals decrease from 69/69 to 55/55, but
+reported structural changes increase from 2,346 to 15,780. More reported
+changes are not themselves an accuracy improvement. The new diff still
+incorrectly matches old =Blr= to new =Zpr= and emits the new =Blr= separately.
+Both sides of the LSP change now survive filtering, but the matcher has not
+recovered the intended old-to-new function correspondence.
+
+Machine-readable sizes and headers:
+[[file:../.sync-temp-astdiff-replay-20260911/comparison.json][comparison.json]].
+
+* What the session logs establish
+
+All three agents read the already-written changelog for the same version:
+
+| Version | Completed shell calls | Calls reading the old answer |
+|---------+-----------------------+------------------------------|
+| 2.1.242 |                     6 |                            5 |
+| 2.1.243 |                     7 |                            7 |
+| 2.1.245 |                     5 |                         4, 5 |
+
+The 2.1.243 trace is particularly informative. Calls 2, 4, 5 and 6 return
+the new =return p4("true");= gate. Call 6 also returns the old
+=return Hi5.ENABLE_LSP_TOOL;= implementation. Call 7 reads the old changelog.
+The final answer then repeats its no-feature-gate-change conclusion. The
+evidence was returned by tools; it was not lost solely in extraction or
+filtering. These observations support an anchoring problem, though a trace
+cannot establish the model's internal cause.
+
+Derived trace summaries, including short gate-evidence excerpts and call
+numbers, are retained with the replay. Full sessions use the bounded logger
+and may rotate after five newer completed runs:
+
+- [[file:../.sync-temp-astdiff-replay-20260911/trace-summary-2.1.242.json][2.1.242 trace summary]].
+- [[file:../.sync-temp-astdiff-replay-20260911/trace-summary-2.1.243.json][2.1.243 trace summary]].
+- [[file:../.sync-temp-astdiff-replay-20260911/trace-summary-2.1.245.json][2.1.245 trace summary]].
+
+* Interpretation and next experiment
+
+This was one retry per version using production's =gpt-5.6-terra= at medium
+reasoning, the existing system prompt, and annotation disabled. No expected
+findings were supplied to the agents. It is an operational replay, not a
+statistical model benchmark or a blinded evaluation: agents could read older
+answers and did so. It also includes the already-applied filtering correction,
+so any difference would not isolate the effect of the binary upgrade alone.
+
+The next controlled replay should exclude the target version's existing
+changelog from the agent's inputs, require explicit old/new evidence for each
+candidate and for a no-change conclusion, and reject unsupported claims that
+all structural changes are rebundling. The Bun comparison also needs better
+module/declaration correspondence; installing the newer matcher did not fix
+the observed getter mispairing. A stronger model can be compared once that
+replay has a fixed evidence set and explicit correctness checks.
+
+No retry output was committed, pushed or posted. The scheduler remains enabled
+and uses the pinned build for future diffs.

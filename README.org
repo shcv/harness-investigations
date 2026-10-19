@@ -19,7 +19,7 @@ to cover the Claude Agent SDK and Codex. The name reflects the broader scope.
 │   ├── claude-agent-sdk/   # @anthropic-ai/claude-agent-sdk (npm)
 │   └── codex/              # openai/codex (GitHub releases, Rust source)
 │       ├── original/       # raw downloads (npm projects only; gitignored)
-│       ├── pretty/         # prettier-formatted (npm projects only; gitignored)
+│       ├── pretty/         # prepared analysis inputs (npm projects only; gitignored)
 │       ├── source/         # git clone (GitHub projects only; gitignored)
 │       ├── diff/           # version-to-version diffs (gitignored)
 │       ├── changes/        # filtered diffs used as changelog input (gitignored)
@@ -83,11 +83,14 @@ Project definitions live in the =PROJECTS= dict near the top of =tools/sync.py=.
 
 1. Python deps:
    #+begin_src bash
-   pip install requests packaging python-dotenv claude-agent-sdk
+   pip install requests packaging python-dotenv
    #+end_src
 
-2. Node tools (for npm-based projects):
+   The optional Claude provider also needs =pip install claude-agent-sdk=.
+
+2. Node tools (for npm-based projects). Install the locked parser and bundler dependencies:
    #+begin_src bash
+   npm ci
    npm install -g prettier
    #+end_src
 
@@ -100,27 +103,32 @@ Project definitions live in the =PROJECTS= dict near the top of =tools/sync.py=.
 4. Authenticate the harness used for changelog generation. The agent provider
    is configurable:
 
-   - =--agent-provider claude= uses =claude-agent-sdk='s =query()= against an
-     isolated config dir at =~/.claude/projects/harness-investigations/= so its
-     sessions don't pollute =--resume= and ccusage groups them under that name.
-     =.credentials.json= and =settings.json= are symlinked in from =~/.claude=
-     on first run.
+   - =--agent-provider claude= uses =claude-agent-sdk='s =query()= with the
+     normal Claude configuration and credentials. Runs use =.agent-cwd/= to
+     separate their session bucket; credentials are not copied or isolated.
    - =--agent-provider codex= shells out to =codex exec= in read-only sandbox
      mode and writes the returned changelog itself. Authenticate with the normal
-     Codex CLI login first. For GitHub-backed projects such as Codex, the
-     pipeline also reads the upstream GitHub release notes and asks the model to
-     distinguish the published highlights from additional changes found in the
-     repo diff.
+     Codex CLI login first. When a project config names a GitHub release-notes
+     repository, the pipeline reads that published baseline even if artifacts
+     come from npm, then asks the model to distinguish published highlights from
+     additional changes found in the code diff.
 
-   You can set the default in =.env=:
+   Codex is the default provider. Copy =.env.example= to =.env= for a new
+   checkout, or update the model settings in an existing =.env=:
 
    #+begin_src bash
    CHANGELOG_AGENT_PROVIDER=codex
-   CHANGELOG_AGENT_MODEL=gpt-5.4
-   CHANGELOG_ANNOTATION_MODEL=gpt-5.4-mini
-   CHANGELOG_CODEX_REASONING_EFFORT=high
+   CHANGELOG_AGENT_MODEL=gpt-6.1-sol
+   CHANGELOG_ANNOTATION_MODEL=gpt-6-luna
+   CHANGELOG_CODEX_REASONING_EFFORT=medium
    CHANGELOG_CODEX_ANNOTATION_REASONING_EFFORT=low
    #+end_src
+
+   All three entry points (=sync.py=, =annotate_changes.py=, and
+   =generate_annotated_changelog.py=) load this checkout's =.env=. Shell
+   environment variables take precedence over the file; command-line flags
+   take precedence over both. Set =CHANGELOG_CODEX_BIN= to an absolute path
+   when the scheduler needs a specific Codex executable.
 
 5. Discord posting (optional). Copy the example config and edit:
    #+begin_src bash
@@ -145,13 +153,16 @@ python tools/sync.py --project codex --all
 python tools/sync.py --project claude-code --all --latest
 
 # Backfill from a specific version
-python tools/sync.py --project claude-code --changelog --since v2.0.0
+python tools/sync.py --project claude-code --prettier --diff --changelog --since v2.0.0
 
 # Newest first (instead of chronological)
 python tools/sync.py --project codex --all --new-first
 
 # Generate using Codex instead of Claude
 python tools/sync.py --project codex --changelog --agent-provider codex
+
+# Local generation with Luna annotations followed by Sol 6.1 prose
+python tools/sync.py --project claude-code --latest --prettier --diff --changelog --annotate
 
 # Redo a single version's changelog (creates iteration -2, -3, ...)
 python tools/sync.py --project claude-code --redo 2.0.37 --changelog
@@ -167,27 +178,57 @@ python tools/sync.py --project codex --post
 | (none)         | Download missing originals into =archive/<proj>/original/= or =source/=   |
 | =--prettier=   | Run prettier over downloaded files (npm projects only)                    |
 | =--diff=       | Generate diffs between consecutive versions                               |
-| =--changes=    | Filter diff noise (version bumps, build paths, reformatting)              |
+| =--changes=    | Filter version/build metadata and pair import changes                   |
 | =--changelog=  | Ask the LLM for a changelog; implies =--changes=                          |
 | =--cleanup=    | Strip duplicate headers / meta-commentary from generated changelogs       |
 | =--post=       | Post new changelogs to Discord via webhook                                |
 | =--all=        | Enable all of the above                                                   |
 
 Useful modifiers: =--latest=, =--since VERSION=, =--new-first=, =--redo SPEC=,
-=--annotate= (fast-model pre-pass; expensive), =--astdiff-threads N=,
-=--agent-provider claude|codex=, =--changelog-model MODEL=,
+=--annotate= (fast-model pre-pass; expensive), =--astdiff-bin PATH=,
+=--astdiff-threads N=, =--allow-degraded-diff=,
+=--agent-provider claude|codex|qwen=, =--changelog-model MODEL=,
 =--annotation-model MODEL=, =--dry-run=.
 
 ** What Lands in Git
 
 Only =archive/<project>/changelog/= (which contains the system prompt and the
-generated changelogs). Everything else — originals, pretty files, diffs,
-changes, source clones, =.sync-temp-*=, =.env=, =tools/config.py=,
-=.last_posted_version_*= — is gitignored.
+generated changelogs). Generated originals, pretty files, diffs,
+changes, =.sync-temp-*=, =.env=, =tools/config.py=, and delivery state are
+local artifacts. The Codex source checkout currently has a tracked Git link;
+its source files are not stored in this repository.
 
-For GitHub-backed projects, bad tag fetches and bad tag-to-tag diffs now fail
-hard instead of being treated as empty changes. When =notify-send= is available,
-hard failures also trigger a best-effort desktop notification.
+For GitHub-backed projects, bad tag fetches and bad tag-to-tag diffs fail
+instead of being treated as empty changes. Direct runs send a best-effort
+desktop notification when =notify-send= is available. The scheduled wrapper
+logs every failure and waits for a persistent 15-minute failure before it exits
+nonzero and sends a desktop notification. At that point, a bounded read-only
+Codex Sol run attempts to explain the failure in one sentence; if it cannot,
+the notification uses a plain fallback.
+
+** Scheduled Operation and Verification
+
+The operating procedure, state files, restart commands, and validation gates
+are documented in [[./docs/changelog-operations.org][Changelog Operations]]. The production wrapper runs
+=claude-code= then =codex= every five minutes using the Codex model settings from
+=.env=. It enables generation, cleanup, Git commit/push, and Discord posting.
+
+Annotations are opt-in: use =--annotate=, or set =CHANGELOG_ANNOTATE=true= in
+=.env= to enable the pre-pass for scheduled runs. =--no-annotate= overrides it.
+Luna handles each annotation batch; Sol 6.1 writes the prose from those
+annotations and the source diff. Both AST diffs and Git unified diffs are
+supported. A failed or malformed annotation batch blocks that changelog;
+successful batches remain cached for the next run. Changing the input, prompt,
+provider, model, or reasoning effort invalidates the relevant cache.
+
+=--dry-run= suppresses commits, pushes, and Discord sends. It still downloads,
+generates, and cleans local artifacts and can invoke the configured model.
+
+Run the offline regression suite with:
+
+#+begin_src bash
+python3 -m unittest discover -s tests -v
+#+end_src
 
 ** Customizing the System Prompt
 
