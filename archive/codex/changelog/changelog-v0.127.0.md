@@ -1,5 +1,9 @@
 # Changelog for version 0.127.0
 
+## Release Status
+
+> **Not yet released:** The `rust-v0.127.0` tag is present in Git, but no published GitHub Release was found when this changelog was synchronized. This may be an intermediate development snapshot or a release prepared ahead of publication.
+
 ## Summary
 
 Codex 0.127.0 adds app-server support for inspecting configured hooks and gives plugin users finer control over plugin-provided MCP servers. It also improves external-session imports, login resilience, feedback diagnostics, and sandbox behavior.

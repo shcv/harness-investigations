@@ -1,5 +1,9 @@
 # Changelog for version 0.126.0
 
+## Release Status
+
+> **Not yet released:** The `rust-v0.126.0` tag is present in Git, but no published GitHub Release was found when this changelog was synchronized. This may be an intermediate development snapshot or a release prepared ahead of publication.
+
 ## Summary
 
 Codex 0.126.0 adds a built-in update command, configurable terminal keybindings, and an experimental Agent Identity login flow. App-server clients gain provider-capability discovery, remote-control status updates, richer external-agent migration support, and an experimental persisted thread-goal API.
